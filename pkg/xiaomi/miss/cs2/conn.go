@@ -24,7 +24,7 @@ func Dial(host, transport string) (*Conn, error) {
 		Conn:  conn,
 		isTCP: isTCP,
 		channels: [4]*dataChannel{
-			newDataChannel(0, 10), nil, newDataChannel(250, 100), nil,
+			newDataChannel(0, 10), nil, newDataChannel(250, 500), nil,
 		},
 	}
 	go c.worker()
@@ -445,7 +445,15 @@ func (c *dataChannel) Push(b []byte) error {
 		select {
 		case c.popBuf <- c.waitData[:c.waitSize]:
 		default:
-			return fmt.Errorf("pop buffer is full")
+			// Buffer full: drop oldest packet to make room instead of
+			// killing the connection. This handles transient slowdowns
+			// from crypto decryption, GC pauses, or high-bitrate /
+			// dual-channel streams.
+			select {
+			case <-c.popBuf:
+			default:
+			}
+			c.popBuf <- c.waitData[:c.waitSize]
 		}
 
 		c.waitData = c.waitData[c.waitSize:]
