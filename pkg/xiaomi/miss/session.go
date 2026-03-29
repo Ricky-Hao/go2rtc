@@ -7,6 +7,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/h264"
+	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
+	"github.com/AlexxIT/go2rtc/pkg/h265"
 )
 
 // session manages a single MISS client connection that can serve multiple
@@ -29,6 +33,13 @@ type session struct {
 
 	speakerOnce sync.Once
 	speakerErr  error
+
+	// Channel classification state (protected by mu).
+	hdrChanSeen   [2]bool          // hdr[28] values seen
+	flagsChanSeen [2]bool          // (flags >> 24) values seen
+	resolutions   map[uint32]uint8 // resolution area → channel
+	lastTS        [2]uint64        // last timestamp per channel
+	tsInit        [2]bool          // whether lastTS is initialized
 }
 
 // stream represents a single channel's view of a session. It receives
@@ -91,16 +102,18 @@ func getOrCreateSession(rawURL string) (*session, error) {
 	// Dafang-like models: no session sharing, return standalone session.
 	if client.IsDafangLike() {
 		return &session{
-			client:  client,
-			key:     key,
-			streams: make(map[*stream]struct{}),
+			client:      client,
+			key:         key,
+			streams:     make(map[*stream]struct{}),
+			resolutions: make(map[uint32]uint8),
 		}, nil
 	}
 
 	s := &session{
-		client:  client,
-		key:     key,
-		streams: make(map[*stream]struct{}),
+		client:      client,
+		key:         key,
+		streams:     make(map[*stream]struct{}),
+		resolutions: make(map[uint32]uint8),
 	}
 
 	sessionMu.Lock()
@@ -208,24 +221,29 @@ func (s *session) dispatch(pkt *Packet) {
 	for st := range s.streams {
 		streams = append(streams, st)
 	}
-	s.mu.Unlock()
 
 	// Audio packets are broadcast to all streams.
 	if isAudioCodec(pkt.CodecID) {
+		s.mu.Unlock()
 		for _, st := range streams {
 			st.push(pkt)
 		}
 		return
 	}
 
-	// If only one stream is active, send all video to it.
+	// Single stream: send all video to it, no classification needed.
 	if len(streams) == 1 {
+		s.mu.Unlock()
 		streams[0].push(pkt)
 		return
 	}
 
-	// Multiple streams: route by channel.
-	ch := s.pickChannel(pkt)
+	// Multiple streams: classify and route. Already holding mu.
+	ch := s.classifyPacket(pkt)
+	s.lastTS[ch] = pkt.Timestamp
+	s.tsInit[ch] = true
+	s.mu.Unlock()
+
 	for _, st := range streams {
 		if st.channel == ch {
 			st.push(pkt)
@@ -233,14 +251,153 @@ func (s *session) dispatch(pkt *Packet) {
 	}
 }
 
-// pickChannel determines which channel a video packet belongs to.
-func (s *session) pickChannel(pkt *Packet) uint8 {
-	// Primary: use the channel field parsed from the packet header.
+// classifyPacket runs through classification strategies in priority order.
+// Must be called with s.mu held.
+func (s *session) classifyPacket(pkt *Packet) uint8 {
+	// Strategy 1: hdr[28] channel field.
+	// Trusted only after seeing both 0 and 1.
 	if pkt.ChannelOK {
-		return pkt.Channel
+		s.hdrChanSeen[pkt.Channel] = true
+		if s.hdrChanSeen[0] && s.hdrChanSeen[1] {
+			return pkt.Channel
+		}
 	}
-	// Fallback: default to channel 0.
+
+	// Strategy 2: (flags >> 24) & 0x01.
+	fch := pkt.FlagsChannel
+	s.flagsChanSeen[fch] = true
+	if s.flagsChanSeen[0] && s.flagsChanSeen[1] {
+		return fch
+	}
+
+	// Strategy 3: Resolution from SPS in keyframes.
+	if ch, ok := s.classifyByResolution(pkt); ok {
+		return ch
+	}
+
+	// Strategy 4: Timestamp continuity.
+	if s.tsInit[0] && s.tsInit[1] {
+		return s.classifyByTimestamp(pkt)
+	}
+
 	return 0
+}
+
+// classifyByTimestamp routes by closest preceding timestamp.
+func (s *session) classifyByTimestamp(pkt *Packet) uint8 {
+	ts := pkt.Timestamp
+
+	if ts == s.lastTS[0] {
+		return 0
+	}
+	if ts == s.lastTS[1] {
+		return 1
+	}
+
+	var d0, d1 uint64
+	if ts >= s.lastTS[0] {
+		d0 = ts - s.lastTS[0]
+	} else {
+		d0 = ^uint64(0)
+	}
+	if ts >= s.lastTS[1] {
+		d1 = ts - s.lastTS[1]
+	} else {
+		d1 = ^uint64(0)
+	}
+
+	if d0 <= d1 {
+		return 0
+	}
+	return 1
+}
+
+// classifyByResolution uses SPS from keyframes to map resolution → channel.
+// Higher resolution = channel 0, lower = channel 1.
+func (s *session) classifyByResolution(pkt *Packet) (uint8, bool) {
+	area := videoResolutionArea(pkt)
+	if area == 0 {
+		return 0, false
+	}
+
+	if ch, ok := s.resolutions[area]; ok {
+		return ch, true
+	}
+
+	s.assignResolution(area)
+	if ch, ok := s.resolutions[area]; ok {
+		return ch, true
+	}
+	return 0, false
+}
+
+// assignResolution adds a resolution and assigns channels.
+// Higher resolution → channel 0, lower → channel 1.
+func (s *session) assignResolution(newArea uint32) {
+	s.resolutions[newArea] = 0
+
+	if len(s.resolutions) < 2 {
+		return
+	}
+
+	var maxArea uint32
+	for area := range s.resolutions {
+		if area > maxArea {
+			maxArea = area
+		}
+	}
+
+	for area := range s.resolutions {
+		if area == maxArea {
+			s.resolutions[area] = 0
+		} else {
+			s.resolutions[area] = 1
+		}
+	}
+}
+
+// videoResolutionArea extracts width*height from H264/H265 SPS in a keyframe.
+func videoResolutionArea(pkt *Packet) uint32 {
+	switch pkt.CodecID {
+	case codecH264:
+		avcc := annexb.EncodeToAVCC(pkt.Payload)
+		if h264.NALUType(avcc) == h264.NALUTypeSPS {
+			sps := h264.DecodeSPS(avcc[4:]) // skip 4-byte AVCC length prefix
+			if sps != nil {
+				return uint32(sps.Width()) * uint32(sps.Height())
+			}
+		}
+	case codecH265:
+		avcc := annexb.EncodeToAVCC(pkt.Payload)
+		if h265.NALUType(avcc) == h265.NALUTypeVPS {
+			// H265 keyframes start with VPS, then SPS. Find the SPS.
+			spsData := findH265SPS(avcc)
+			if spsData != nil {
+				sps := h265.DecodeSPS(spsData)
+				if sps != nil {
+					return uint32(sps.Width()) * uint32(sps.Height())
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// findH265SPS searches for an SPS NALU in AVCC-formatted H265 data.
+func findH265SPS(avcc []byte) []byte {
+	for i := 0; i+4 < len(avcc); {
+		size := int(avcc[i])<<24 | int(avcc[i+1])<<16 | int(avcc[i+2])<<8 | int(avcc[i+3])
+		i += 4
+		if size <= 0 || i+size > len(avcc) {
+			break
+		}
+		naluType := (avcc[i] >> 1) & 0x3F
+		if naluType == h265.NALUTypeSPS {
+			return avcc[i : i+size]
+		}
+		i += size
+	}
+	return nil
 }
 
 // startSpeaker starts the speaker on the session (once).

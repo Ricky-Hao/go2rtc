@@ -126,11 +126,6 @@ func (c *Client) Version() string {
 	return fmt.Sprintf("%s (%s)", c.Conn.Version(), c.model)
 }
 
-// Model returns the camera model string.
-func (c *Client) Model() string {
-	return c.model
-}
-
 // IsDafangLike returns true for models that use the dafang firmware
 // protocol and do not support standard dual-channel commands.
 func (c *Client) IsDafangLike() bool {
@@ -273,16 +268,19 @@ func (c *Client) ReadPacket() (*Packet, error) {
 		Payload:  payload,
 	}
 
-	// Parse channel from header byte 28 for dual-channel cameras.
-	// Valid values: 0 or 1, with frame type in hdr[24:28] being <= 3.
+	// Parse channel from header for dual-channel cameras.
+	// Primary: byte 28 (some cameras set this directly).
 	if len(hdr) >= 29 {
-		frameType := binary.LittleEndian.Uint32(hdr[24:28])
 		ch := hdr[28]
-		if ch <= 1 && frameType <= 3 {
+		if ch <= 1 {
 			pkt.Channel = ch
 			pkt.ChannelOK = true
 		}
 	}
+
+	// Secondary: high byte of flags field (flags >> 24).
+	// Some cameras encode channel here instead of in byte 28.
+	pkt.FlagsChannel = uint8((pkt.Flags >> 24) & 0x01)
 
 	switch c.model {
 	case ModelDafang, ModelXiaofang, ModelLoockV2:
@@ -313,12 +311,13 @@ func (c *Client) WriteAudio(codecID uint32, payload []byte) error {
 
 type Packet struct {
 	//Length    uint32
-	CodecID   uint32
-	Sequence  uint32
-	Flags     uint32
-	Timestamp uint64 // msec
-	Channel   uint8  // video channel (0 or 1), parsed from header
-	ChannelOK bool   // true if Channel was successfully parsed
+	CodecID      uint32
+	Sequence     uint32
+	Flags        uint32
+	Timestamp    uint64 // msec
+	Channel      uint8  // video channel from hdr[28]
+	ChannelOK    bool   // true if Channel was parsed (0 or 1)
+	FlagsChannel uint8  // video channel from (flags >> 24) & 0x01
 	//TimestampS uint32
 	//Reserved uint32
 	Payload []byte
