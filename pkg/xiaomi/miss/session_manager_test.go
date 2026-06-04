@@ -340,16 +340,23 @@ func TestSessionManagerConcurrentAcquireClosesDuplicateClient(t *testing.T) {
 
 func TestParseChannel(t *testing.T) {
 	query := url.Values{}
-	require.Equal(t, uint8(0), parseChannel(query))
+	channel, err := parseChannel(query)
+	require.NoError(t, err)
+	require.Equal(t, uint8(0), channel)
 
 	query.Set("channel", "0")
-	require.Equal(t, uint8(0), parseChannel(query))
+	channel, err = parseChannel(query)
+	require.NoError(t, err)
+	require.Equal(t, uint8(0), channel)
 
 	query.Set("channel", "1")
-	require.Equal(t, uint8(1), parseChannel(query))
+	channel, err = parseChannel(query)
+	require.NoError(t, err)
+	require.Equal(t, uint8(1), channel)
 
 	query.Set("channel", "2")
-	require.Equal(t, uint8(0), parseChannel(query))
+	_, err = parseChannel(query)
+	require.Error(t, err)
 }
 
 func waitWorker(t *testing.T, s *session) {

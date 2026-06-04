@@ -3,6 +3,7 @@ package miss
 import (
 	"fmt"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -20,7 +21,10 @@ type Producer struct {
 func Dial(rawURL string) (core.Producer, error) {
 	u, _ := url.Parse(rawURL)
 	query := u.Query()
-	channel := parseChannel(query)
+	channel, err := parseChannel(query)
+	if err != nil {
+		return nil, err
+	}
 
 	sess, st, err := defaultSessionManager.acquire(rawURL, channel)
 	if err != nil {
@@ -54,11 +58,15 @@ func Dial(rawURL string) (core.Producer, error) {
 	}, nil
 }
 
-func parseChannel(query url.Values) uint8 {
-	if query.Get("channel") == "1" {
-		return 1
+func parseChannel(query url.Values) (uint8, error) {
+	raw := query.Get("channel")
+	switch raw {
+	case "", "0":
+		return 0, nil
+	case "1":
+		return 1, nil
 	}
-	return 0
+	return 0, fmt.Errorf("xiaomi: unsupported channel: %s", strconv.Quote(raw))
 }
 
 func probe(st *stream, audio bool) ([]*core.Media, error) {
