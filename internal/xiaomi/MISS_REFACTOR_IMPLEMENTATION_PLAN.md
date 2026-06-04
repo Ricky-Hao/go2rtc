@@ -136,11 +136,9 @@ The existing backchannel path calls session methods through
 session-level methods available, and make the test client seam cover them
 instead of adding a separate producer/backchannel abstraction in this refactor.
 
-The current README documents `channel=2` for the second Xiaomi channel, while
-the current code also has behavior around channel index `1`. The refactor must
-centralize channel parsing and preserve compatibility by accepting both the
-documented user-facing value (`channel=2`) and the existing internal/test value
-(`channel=1`) as requests for second channel `1`.
+The valid Xiaomi channel values are `channel=0` and `channel=1`. The current
+README text that mentions `channel=2` is wrong and should be fixed as part of
+the refactor cleanup, not preserved as compatibility behavior.
 
 ## Key invariants
 
@@ -397,7 +395,8 @@ Required characterization tests:
 4. no-stream shutdown attempts bounded `StopMedia`
 5. single-channel to dual-channel upgrade calls `StartMediaDual`
 6. `StartMediaDual` failure does not mark the second channel started
-7. `channel=2` and `channel=1` both select internal channel `1`
+7. `channel=0` selects internal channel `0`, and `channel=1` selects internal
+   channel `1`
 
 ### Acceptance
 
