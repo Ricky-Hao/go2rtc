@@ -18,20 +18,14 @@ type Producer struct {
 }
 
 func Dial(rawURL string) (core.Producer, error) {
-	sess, err := getOrCreateSession(rawURL)
+	u, _ := url.Parse(rawURL)
+	query := u.Query()
+	channel := parseChannel(query)
+
+	sess, st, err := defaultSessionManager.acquire(rawURL, channel)
 	if err != nil {
 		return nil, err
 	}
-
-	u, _ := url.Parse(rawURL)
-	query := u.Query()
-
-	var channel uint8
-	if query.Get("channel") == "1" {
-		channel = 1
-	}
-
-	st := sess.openStream(channel)
 
 	audio := query.Get("audio")
 	err = sess.startMedia(channel, query.Get("subtype"), audio)
@@ -58,6 +52,13 @@ func Dial(rawURL string) (core.Producer, error) {
 		},
 		stream: st,
 	}, nil
+}
+
+func parseChannel(query url.Values) uint8 {
+	if query.Get("channel") == "1" {
+		return 1
+	}
+	return 0
 }
 
 func probe(st *stream, audio bool) ([]*core.Media, error) {

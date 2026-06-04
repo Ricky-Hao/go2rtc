@@ -56,9 +56,9 @@ streams:
   xiaomi1: xiaomi://***&subtype=sd
 ```
 
-You can use a second channel for dual cameras: `channel=2`.
+You can use a second channel for dual cameras: `channel=1`.
 
 ```yaml
 streams:
-  xiaomi1: xiaomi://***&channel=2
+  xiaomi1: xiaomi://***&channel=1
 ```

@@ -1,6 +1,7 @@
 package miss
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/url"
@@ -14,18 +15,21 @@ import (
 // share the same underlying UDP/TCP session to avoid exhausting the camera's
 // limited connection slots.
 type session struct {
-	client *Client
-	key    string // cache key: host|did
+	client  sessionClient
+	key     string // cache key: host|did
+	manager *sessionManager
 
 	mu      sync.Mutex
 	streams map[*stream]struct{}
+	state   sessionState
+	reason  shutdownReason
 
 	// startedMask tracks which channels have been started (bit 0 = ch0, bit 1 = ch1).
 	startedMask uint8
 	quality     [2]string // remembered quality per channel
 
 	workerOnce sync.Once
-	closeOnce  sync.Once
+	workerDone chan struct{}
 
 	speakerOnce sync.Once
 	speakerErr  error
@@ -46,12 +50,43 @@ type stream struct {
 	done      chan struct{}
 }
 
-var (
-	sessionMu sync.Mutex
-	sessions  = map[string]*session{}
+type sessionClient interface {
+	Protocol() string
+	Version() string
+	IsDafangLike() bool
+	StartMedia(channel, quality, audio string) error
+	StartMediaDual(quality0, quality1, audio string) error
+	StopMedia() error
+	StartSpeaker() error
+	SpeakerCodec() uint32
+	WriteAudio(codecID uint32, payload []byte) error
+	ReadPacket() (*Packet, error)
+	RemoteAddr() net.Addr
+	SetDeadline(t time.Time) error
+	Close() error
+}
+
+type sessionState uint8
+
+const (
+	sessionActive sessionState = iota
+	sessionClosing
+	sessionClosed
 )
 
-const stopMediaTimeout = time.Second
+type shutdownReason uint8
+
+const (
+	shutdownReadError shutdownReason = iota
+	shutdownNoStreams
+)
+
+const (
+	stopMediaTimeout  = time.Second
+	workerStopTimeout = time.Second
+)
+
+var errSessionClosing = errors.New("miss: session is closing")
 
 // sessionKey builds a cache key from the URL. Two URLs pointing to the same
 // camera (same host and did) will share a session.
@@ -67,62 +102,36 @@ func sessionKey(rawURL string) (string, error) {
 	return key, nil
 }
 
-// getOrCreateSession returns an existing session for the camera or creates a
-// new one. Dafang-like models that don't support dual-channel always get a
-// fresh client (no session sharing).
-func getOrCreateSession(rawURL string) (*session, error) {
-	key, err := sessionKey(rawURL)
-	if err != nil {
-		return nil, err
-	}
-
-	sessionMu.Lock()
-	if s, ok := sessions[key]; ok {
-		// Reuse existing session only if the underlying client supports
-		// dual-channel (not dafang-like).
-		if !s.client.IsDafangLike() {
-			sessionMu.Unlock()
-			return s, nil
-		}
-	}
-	sessionMu.Unlock()
-
-	client, err := NewClient(rawURL)
-	if err != nil {
-		return nil, err
-	}
-
-	s := newSession(client, key)
-
-	// Dafang-like models: no session sharing, return standalone session.
-	if client.IsDafangLike() {
-		return s, nil
-	}
-
-	sessionMu.Lock()
-	if existing, ok := sessions[key]; ok {
-		// Another goroutine created it between our check and now.
-		sessionMu.Unlock()
-		_ = client.Close()
-		return existing, nil
-	}
-	sessions[key] = s
-	sessionMu.Unlock()
-
-	return s, nil
-}
-
-func newSession(client *Client, key string) *session {
+func newSession(client sessionClient, key string, manager *sessionManager) *session {
 	return &session{
 		client:     client,
 		key:        key,
+		manager:    manager,
 		streams:    make(map[*stream]struct{}),
+		state:      sessionActive,
+		workerDone: make(chan struct{}),
 		classifier: newPacketClassifier(),
 	}
 }
 
 // openStream creates a new stream for the given channel on this session.
-func (s *session) openStream(channel uint8) *stream {
+func (s *session) openStream(channel uint8) (*stream, error) {
+	s.mu.Lock()
+	st, err := s.openStreamLocked(channel)
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	s.startWorker()
+	return st, nil
+}
+
+// openStreamLocked creates a new stream while s.mu is held.
+func (s *session) openStreamLocked(channel uint8) (*stream, error) {
+	if s.state != sessionActive {
+		return nil, errSessionClosing
+	}
+
 	st := &stream{
 		session: s,
 		channel: channel,
@@ -131,15 +140,14 @@ func (s *session) openStream(channel uint8) *stream {
 	}
 	st.deadline.Store(time.Time{})
 
-	s.mu.Lock()
 	s.streams[st] = struct{}{}
-	s.mu.Unlock()
+	return st, nil
+}
 
+func (s *session) startWorker() {
 	s.workerOnce.Do(func() {
 		go s.worker()
 	})
-
-	return st
 }
 
 // startMedia sends the appropriate VideoStart command. If only one channel is
@@ -188,12 +196,14 @@ func (s *session) startMedia(channel uint8, quality, audio string) error {
 
 // worker is the read loop that dispatches packets to streams.
 func (s *session) worker() {
+	defer close(s.workerDone)
+
 	for {
 		_ = s.client.SetDeadline(time.Now().Add(10 * time.Second))
 
 		pkt, err := s.client.ReadPacket()
 		if err != nil {
-			s.shutdown(false)
+			s.shutdown(shutdownReadError)
 			return
 		}
 
@@ -274,44 +284,63 @@ func (s *session) removeStream(st *stream) {
 	st.close()
 
 	if empty {
-		s.shutdown(true)
+		s.shutdown(shutdownNoStreams)
 	}
 }
 
 // shutdown tears down the session, closing all streams and the client.
-func (s *session) shutdown(stopMedia bool) {
-	s.closeOnce.Do(func() {
-		s.removeFromCache()
-
-		for _, st := range s.closeStreams() {
-			st.close()
-		}
-
-		if stopMedia {
-			s.stopMedia()
-		}
-		_ = s.client.Close()
-	})
-}
-
-func (s *session) removeFromCache() {
-	sessionMu.Lock()
-	if sessions[s.key] == s {
-		delete(sessions, s.key)
+func (s *session) shutdown(reason shutdownReason) {
+	streams, ok := s.beginShutdown(reason)
+	if !ok {
+		return
 	}
-	sessionMu.Unlock()
+
+	if s.manager != nil {
+		s.manager.remove(s)
+	}
+
+	for _, st := range streams {
+		st.close()
+	}
+
+	if reason == shutdownNoStreams {
+		s.stopMedia()
+	}
+	_ = s.client.Close()
+
+	if reason == shutdownNoStreams {
+		s.waitWorkerDone()
+	}
+
+	s.finishShutdown()
 }
 
-func (s *session) closeStreams() []*stream {
+func (s *session) beginShutdown(reason shutdownReason) ([]*stream, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.state != sessionActive {
+		return nil, false
+	}
+	s.state = sessionClosing
+	s.reason = reason
 
 	streams := make([]*stream, 0, len(s.streams))
 	for st := range s.streams {
 		streams = append(streams, st)
 	}
 	s.streams = make(map[*stream]struct{})
-	return streams
+	return streams, true
+}
+
+func (s *session) finishShutdown() {
+	s.mu.Lock()
+	s.state = sessionClosed
+	s.mu.Unlock()
+}
+
+func (s *session) isActiveLocked() bool {
+	return s.state == sessionActive
 }
 
 func (s *session) stopMedia() {
@@ -328,6 +357,16 @@ func (s *session) stopMedia() {
 
 	select {
 	case <-done:
+	case <-timer.C:
+	}
+}
+
+func (s *session) waitWorkerDone() {
+	timer := time.NewTimer(workerStopTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-s.workerDone:
 	case <-timer.C:
 	}
 }
