@@ -29,6 +29,7 @@ type session struct {
 	// startedMask tracks which channels have been started (bit 0 = ch0, bit 1 = ch1).
 	startedMask uint8
 	quality     [2]string // remembered quality per channel
+	mediaAudio  bool
 
 	workerOnce sync.Once
 	workerDone chan struct{}
@@ -46,6 +47,7 @@ type session struct {
 type stream struct {
 	session *session
 	channel uint8
+	audio   bool
 	ch      chan *Packet
 
 	closeOnce sync.Once
@@ -118,9 +120,9 @@ func newSession(client sessionClient, key string, manager *sessionManager) *sess
 }
 
 // openStream creates a new stream for the given channel on this session.
-func (s *session) openStream(channel uint8) (*stream, error) {
+func (s *session) openStream(channel uint8, audio bool) (*stream, error) {
 	s.mu.Lock()
-	st, err := s.openStreamLocked(channel)
+	st, err := s.openStreamLocked(channel, audio)
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -130,7 +132,7 @@ func (s *session) openStream(channel uint8) (*stream, error) {
 }
 
 // openStreamLocked creates a new stream while s.mu is held.
-func (s *session) openStreamLocked(channel uint8) (*stream, error) {
+func (s *session) openStreamLocked(channel uint8, audio bool) (*stream, error) {
 	if s.state != sessionActive {
 		return nil, errSessionClosing
 	}
@@ -138,6 +140,7 @@ func (s *session) openStreamLocked(channel uint8) (*stream, error) {
 	st := &stream{
 		session: s,
 		channel: channel,
+		audio:   audio,
 		ch:      make(chan *Packet, 100),
 		done:    make(chan struct{}),
 	}
@@ -156,7 +159,7 @@ func (s *session) startWorker() {
 // startMedia sends the appropriate VideoStart command. If only one channel is
 // active, it sends a single-channel command. If both channels are active, it
 // sends a dual-channel command.
-func (s *session) startMedia(channel uint8, quality, audio string) error {
+func (s *session) startMedia(channel uint8, quality, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -167,11 +170,15 @@ func (s *session) startMedia(channel uint8, quality, audio string) error {
 
 	// Already started this channel.
 	if s.startedMask&(1<<ch) != 0 {
+		if !s.mediaAudio && s.audioEnabledLocked() {
+			return s.enableAudioLocked()
+		}
 		return nil
 	}
 
 	s.quality[ch] = quality
 	other := ch ^ 1
+	audio := s.audioParamLocked()
 
 	// If the other channel is already started, upgrade to dual-channel.
 	if s.startedMask&(1<<other) != 0 {
@@ -182,6 +189,7 @@ func (s *session) startMedia(channel uint8, quality, audio string) error {
 			return err
 		}
 		s.startedMask |= 1 << ch
+		s.mediaAudio = audio != "0"
 		return nil
 	}
 
@@ -194,7 +202,53 @@ func (s *session) startMedia(channel uint8, quality, audio string) error {
 		return err
 	}
 	s.startedMask |= 1 << ch
+	s.mediaAudio = audio != "0"
 	return nil
+}
+
+func (s *session) audioEnabledLocked() bool {
+	for st := range s.streams {
+		if st.audio {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *session) audioParamLocked() string {
+	if s.audioEnabledLocked() {
+		return "1"
+	}
+	return "0"
+}
+
+func (s *session) enableAudioLocked() error {
+	if s.startedMask == 0 {
+		return nil
+	}
+
+	var err error
+	if s.startedMask == 0b11 {
+		err = s.client.StartMediaDual(s.quality[0], s.quality[1], "1")
+	} else {
+		ch := uint8(0)
+		if s.startedMask&0b10 != 0 {
+			ch = 1
+		}
+		err = s.client.StartMedia(channelString(ch), s.quality[ch], "1")
+	}
+	if err != nil {
+		return err
+	}
+	s.mediaAudio = true
+	return nil
+}
+
+func channelString(channel uint8) string {
+	if channel == 1 {
+		return "1"
+	}
+	return "0"
 }
 
 // worker is the read loop that dispatches packets to streams.
@@ -236,10 +290,19 @@ func (s *session) dispatch(pkt *Packet) {
 		return
 	}
 
-	// Single stream: send all video to it, no classification needed.
-	if len(streams) == 1 {
+	// Single stream before dual mode: send all video to it, no classification needed.
+	if len(streams) == 1 && s.startedMask != 0b11 {
 		s.mu.Unlock()
 		streams[0].push(pkt)
+		return
+	}
+
+	if len(streams) == 1 {
+		ch, ok := s.classifier.ClassifyKnown(pkt)
+		s.mu.Unlock()
+		if !ok || streams[0].channel == ch {
+			streams[0].push(pkt)
+		}
 		return
 	}
 
@@ -297,12 +360,7 @@ func (s *session) cachedAudioCodec() *core.Codec {
 }
 
 func (s *session) defaultAudioCodec() *core.Codec {
-	switch s.speakerCodec() {
-	case codecOPUS:
-		return &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
-	default:
-		return &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
-	}
+	return &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
 }
 
 func (s *session) talkCodec() *core.Codec {

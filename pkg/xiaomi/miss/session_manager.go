@@ -25,13 +25,13 @@ func newSessionManager(newClient clientFactory) *sessionManager {
 	}
 }
 
-func (m *sessionManager) acquire(rawURL string, channel uint8) (*session, *stream, error) {
+func (m *sessionManager) acquire(rawURL string, channel uint8, audio bool) (*session, *stream, error) {
 	key, err := sessionKey(rawURL)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if s, st, ok := m.acquireExisting(key, channel); ok {
+	if s, st, ok := m.acquireExisting(key, channel, audio); ok {
 		return s, st, nil
 	}
 
@@ -43,7 +43,7 @@ func (m *sessionManager) acquire(rawURL string, channel uint8) (*session, *strea
 	// Dafang-like models: no session sharing, return standalone session.
 	if client.IsDafangLike() {
 		s := newSession(client, key, nil)
-		st, err := s.openStream(channel)
+		st, err := s.openStream(channel, audio)
 		if err != nil {
 			_ = client.Close()
 			return nil, nil, err
@@ -57,7 +57,7 @@ func (m *sessionManager) acquire(rawURL string, channel uint8) (*session, *strea
 	if existing, ok := m.sessions[key]; ok {
 		existing.mu.Lock()
 		if existing.isActiveLocked() && !existing.client.IsDafangLike() {
-			st, err := existing.openStreamLocked(channel)
+			st, err := existing.openStreamLocked(channel, audio)
 			existing.mu.Unlock()
 			m.mu.Unlock()
 			_ = client.Close()
@@ -71,7 +71,7 @@ func (m *sessionManager) acquire(rawURL string, channel uint8) (*session, *strea
 	}
 
 	s.mu.Lock()
-	st, err := s.openStreamLocked(channel)
+	st, err := s.openStreamLocked(channel, audio)
 	s.mu.Unlock()
 	if err != nil {
 		m.mu.Unlock()
@@ -85,7 +85,7 @@ func (m *sessionManager) acquire(rawURL string, channel uint8) (*session, *strea
 	return s, st, nil
 }
 
-func (m *sessionManager) acquireExisting(key string, channel uint8) (*session, *stream, bool) {
+func (m *sessionManager) acquireExisting(key string, channel uint8, audio bool) (*session, *stream, bool) {
 	m.mu.Lock()
 	s, ok := m.sessions[key]
 	if !ok {
@@ -100,7 +100,7 @@ func (m *sessionManager) acquireExisting(key string, channel uint8) (*session, *
 		return nil, nil, false
 	}
 
-	st, err := s.openStreamLocked(channel)
+	st, err := s.openStreamLocked(channel, audio)
 	s.mu.Unlock()
 	m.mu.Unlock()
 	if err != nil {

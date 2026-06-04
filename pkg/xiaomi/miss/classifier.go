@@ -29,6 +29,15 @@ func (c *packetClassifier) Classify(pkt *Packet) uint8 {
 	return ch
 }
 
+func (c *packetClassifier) ClassifyKnown(pkt *Packet) (uint8, bool) {
+	ch, ok := c.classifyKnown(pkt)
+	if ok {
+		c.lastTS[ch] = pkt.Timestamp
+		c.tsInit[ch] = true
+	}
+	return ch, ok
+}
+
 func (c *packetClassifier) classify(pkt *Packet) uint8 {
 	// Strategy 1: hdr[28] channel field.
 	// Trusted only after seeing both 0 and 1.
@@ -57,6 +66,31 @@ func (c *packetClassifier) classify(pkt *Packet) uint8 {
 	}
 
 	return 0
+}
+
+func (c *packetClassifier) classifyKnown(pkt *Packet) (uint8, bool) {
+	if pkt.ChannelOK {
+		c.hdrChanSeen[pkt.Channel] = true
+		if c.hdrChanSeen[0] && c.hdrChanSeen[1] {
+			return pkt.Channel, true
+		}
+	}
+
+	fch := pkt.FlagsChannel
+	c.flagsChanSeen[fch] = true
+	if c.flagsChanSeen[0] && c.flagsChanSeen[1] {
+		return fch, true
+	}
+
+	if ch, ok := c.classifyByKnownResolution(pkt); ok {
+		return ch, true
+	}
+
+	if c.tsInit[0] && c.tsInit[1] {
+		return c.classifyByTimestamp(pkt), true
+	}
+
+	return 0, false
 }
 
 // classifyByTimestamp routes by closest preceding timestamp.
@@ -105,6 +139,26 @@ func (c *packetClassifier) classifyByResolution(pkt *Packet) (uint8, bool) {
 		return ch, true
 	}
 	return 0, false
+}
+
+func (c *packetClassifier) classifyByKnownResolution(pkt *Packet) (uint8, bool) {
+	area := videoResolutionArea(pkt)
+	if area == 0 {
+		return 0, false
+	}
+
+	if len(c.resolutions) >= 2 {
+		if ch, ok := c.resolutions[area]; ok {
+			return ch, true
+		}
+	}
+
+	c.assignResolution(area)
+	if len(c.resolutions) < 2 {
+		return 0, false
+	}
+	ch, ok := c.resolutions[area]
+	return ch, ok
 }
 
 // assignResolution adds a resolution and assigns channels.

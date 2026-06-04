@@ -22,13 +22,16 @@ type fakeClient struct {
 
 	dafang bool
 
-	startMediaChannels []string
-	startMediaDual     int
-	startMediaDualErr  error
-	stopMedia          int
-	startSpeaker       int
-	writeAudio         int
-	closeCount         int
+	startMediaChannels  []string
+	startMediaAudio     []string
+	startMediaDual      int
+	startMediaDualAudio []string
+	startMediaDualErr   error
+	stopMedia           int
+	startSpeaker        int
+	writeAudio          int
+	closeCount          int
+	speakerCodec        uint32
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -48,16 +51,18 @@ func (c *fakeClient) IsDafangLike() bool {
 	return c.dafang
 }
 
-func (c *fakeClient) StartMedia(channel, _, _ string) error {
+func (c *fakeClient) StartMedia(channel, _, audio string) error {
 	c.mu.Lock()
 	c.startMediaChannels = append(c.startMediaChannels, channel)
+	c.startMediaAudio = append(c.startMediaAudio, audio)
 	c.mu.Unlock()
 	return nil
 }
 
-func (c *fakeClient) StartMediaDual(_, _, _ string) error {
+func (c *fakeClient) StartMediaDual(_, _, audio string) error {
 	c.mu.Lock()
 	c.startMediaDual++
+	c.startMediaDualAudio = append(c.startMediaDualAudio, audio)
 	err := c.startMediaDualErr
 	c.mu.Unlock()
 	return err
@@ -77,7 +82,12 @@ func (c *fakeClient) StartSpeaker() error {
 	return nil
 }
 
-func (c *fakeClient) SpeakerCodec() uint32 { return codecPCMA }
+func (c *fakeClient) SpeakerCodec() uint32 {
+	if c.speakerCodec != 0 {
+		return c.speakerCodec
+	}
+	return codecPCMA
+}
 
 func (c *fakeClient) WriteAudio(uint32, []byte) error {
 	c.mu.Lock()
@@ -119,15 +129,21 @@ func (c *fakeClient) counts() (stopMedia, closeCount, startMediaDual int, startM
 	return c.stopMedia, c.closeCount, c.startMediaDual, append([]string(nil), c.startMediaChannels...)
 }
 
+func (c *fakeClient) audioCommands() (startMediaAudio, startMediaDualAudio []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.startMediaAudio...), append([]string(nil), c.startMediaDualAudio...)
+}
+
 func TestSessionManagerAcquireReusesActiveSession(t *testing.T) {
 	client := newFakeClient()
 	manager := newSessionManager(func(string) (sessionClient, error) {
 		return client, nil
 	})
 
-	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0)
+	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0, true)
 	require.NoError(t, err)
-	s2, st2, err := manager.acquire("xiaomi://host?did=1", 1)
+	s2, st2, err := manager.acquire("xiaomi://host?did=1", 1, true)
 	require.NoError(t, err)
 	require.Same(t, s1, s2)
 	require.Equal(t, uint8(0), st1.channel)
@@ -147,9 +163,9 @@ func TestSessionManagerDoesNotShareDafangLikeSession(t *testing.T) {
 		return client, nil
 	})
 
-	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0)
+	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0, true)
 	require.NoError(t, err)
-	s2, st2, err := manager.acquire("xiaomi://host?did=1", 1)
+	s2, st2, err := manager.acquire("xiaomi://host?did=1", 1, true)
 	require.NoError(t, err)
 	require.NotSame(t, s1, s2)
 	require.Len(t, clients, 2)
@@ -166,7 +182,7 @@ func TestSessionReadErrorShutdownSkipsStopMedia(t *testing.T) {
 		return client, nil
 	})
 
-	s, _, err := manager.acquire("xiaomi://host?did=1", 0)
+	s, _, err := manager.acquire("xiaomi://host?did=1", 0, true)
 	require.NoError(t, err)
 
 	client.readErr <- errors.New("read failed")
@@ -183,7 +199,7 @@ func TestSessionNoStreamsShutdownStopsMedia(t *testing.T) {
 		return client, nil
 	})
 
-	s, st, err := manager.acquire("xiaomi://host?did=1", 0)
+	s, st, err := manager.acquire("xiaomi://host?did=1", 0, true)
 	require.NoError(t, err)
 	require.NoError(t, st.Close())
 	waitWorker(t, s)
@@ -199,10 +215,10 @@ func TestSessionStartMediaDualUpgrade(t *testing.T) {
 		return client, nil
 	})
 
-	s, st0, err := manager.acquire("xiaomi://host?did=1", 0)
+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, true)
 	require.NoError(t, err)
 	require.NoError(t, s.startMedia(0, "hd", "1"))
-	_, st1, err := manager.acquire("xiaomi://host?did=1", 1)
+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, true)
 	require.NoError(t, err)
 	require.NoError(t, s.startMedia(1, "sd", "1"))
 
@@ -216,6 +232,115 @@ func TestSessionStartMediaDualUpgrade(t *testing.T) {
 	waitWorker(t, s)
 }
 
+func TestSessionStartMediaDualKeepsSharedAudioEnabled(t *testing.T) {
+	client := newFakeClient()
+	manager := newSessionManager(func(string) (sessionClient, error) {
+		return client, nil
+	})
+
+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, true)
+	require.NoError(t, err)
+	require.NoError(t, s.startMedia(0, "hd", "1"))
+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, false)
+	require.NoError(t, err)
+	require.NoError(t, s.startMedia(1, "sd", "0"))
+
+	startMediaAudio, startMediaDualAudio := client.audioCommands()
+	require.Equal(t, []string{"1"}, startMediaAudio)
+	require.Equal(t, []string{"1"}, startMediaDualAudio)
+
+	require.NoError(t, st1.Close())
+	require.NoError(t, st0.Close())
+	waitWorker(t, s)
+}
+
+func TestSessionStartMediaEnablesAudioForAlreadyStartedChannel(t *testing.T) {
+	client := newFakeClient()
+	manager := newSessionManager(func(string) (sessionClient, error) {
+		return client, nil
+	})
+
+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, false)
+	require.NoError(t, err)
+	require.NoError(t, s.startMedia(0, "hd", "0"))
+	_, st1, err := manager.acquire("xiaomi://host?did=1", 0, true)
+	require.NoError(t, err)
+	require.NoError(t, s.startMedia(0, "hd", "1"))
+
+	startMediaAudio, startMediaDualAudio := client.audioCommands()
+	require.Equal(t, []string{"0", "1"}, startMediaAudio)
+	require.Empty(t, startMediaDualAudio)
+
+	require.NoError(t, st1.Close())
+	require.NoError(t, st0.Close())
+	waitWorker(t, s)
+}
+
+func TestSessionDispatchClassifiesAfterDualStreamCloses(t *testing.T) {
+	s := newSession(newFakeClient(), "key", nil)
+
+	s.mu.Lock()
+	st0, err := s.openStreamLocked(0, true)
+	require.NoError(t, err)
+	st1, err := s.openStreamLocked(1, true)
+	require.NoError(t, err)
+	s.startedMask = 0b11
+	s.mu.Unlock()
+
+	prime0 := &Packet{CodecID: 0xFFFF, FlagsChannel: 0}
+	prime1 := &Packet{CodecID: 0xFFFF, FlagsChannel: 1}
+	s.dispatch(prime0)
+	s.dispatch(prime1)
+	require.Same(t, prime0, <-st0.ch)
+	require.Same(t, prime1, <-st1.ch)
+
+	require.NoError(t, st0.Close())
+	pkt0 := &Packet{CodecID: 0xFFFF, FlagsChannel: 0}
+	pkt1 := &Packet{CodecID: 0xFFFF, FlagsChannel: 1}
+	s.dispatch(pkt0)
+	s.dispatch(pkt1)
+
+	select {
+	case got := <-st1.ch:
+		require.Same(t, pkt1, got)
+	default:
+		t.Fatal("expected remaining channel stream to receive its own packet")
+	}
+
+	select {
+	case got := <-st1.ch:
+		t.Fatalf("unexpected extra packet: %#v", got)
+	default:
+	}
+
+	st1.close()
+}
+
+func TestSessionDispatchKeepsSingleStreamBeforeClassifierIsReady(t *testing.T) {
+	s := newSession(newFakeClient(), "key", nil)
+
+	s.mu.Lock()
+	st0, err := s.openStreamLocked(0, true)
+	require.NoError(t, err)
+	st1, err := s.openStreamLocked(1, true)
+	require.NoError(t, err)
+	s.startedMask = 0b11
+	s.mu.Unlock()
+
+	require.NoError(t, st0.Close())
+	pkt1 := &Packet{CodecID: 0xFFFF, FlagsChannel: 1}
+	s.dispatch(pkt1)
+
+	select {
+	case got := <-st1.ch:
+		require.Same(t, pkt1, got)
+	default:
+		t.Fatal("expected remaining channel stream to receive packet before classifier is ready")
+	}
+
+	st1.close()
+}
+
 func TestSessionStartMediaDualFailureDoesNotMarkSecondChannelStarted(t *testing.T) {
 	client := newFakeClient()
 	client.startMediaDualErr = errors.New("dual failed")
@@ -223,10 +348,10 @@ func TestSessionStartMediaDualFailureDoesNotMarkSecondChannelStarted(t *testing.
 		return client, nil
 	})
 
-	s, st0, err := manager.acquire("xiaomi://host?did=1", 0)
+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, true)
 	require.NoError(t, err)
 	require.NoError(t, s.startMedia(0, "hd", "1"))
-	_, st1, err := manager.acquire("xiaomi://host?did=1", 1)
+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, true)
 	require.NoError(t, err)
 	require.Error(t, s.startMedia(1, "sd", "1"))
 	require.Equal(t, uint8(0b01), s.startedMask)
@@ -244,12 +369,12 @@ func TestSessionManagerRedialsAfterReadError(t *testing.T) {
 		return client, nil
 	})
 
-	s1, _, err := manager.acquire("xiaomi://host?did=1", 0)
+	s1, _, err := manager.acquire("xiaomi://host?did=1", 0, true)
 	require.NoError(t, err)
 	clients[0].readErr <- errors.New("read failed")
 	waitWorker(t, s1)
 
-	s2, st2, err := manager.acquire("xiaomi://host?did=1", 0)
+	s2, st2, err := manager.acquire("xiaomi://host?did=1", 0, true)
 	require.NoError(t, err)
 	require.NotSame(t, s1, s2)
 	require.Len(t, clients, 2)
@@ -266,12 +391,12 @@ func TestSessionManagerRedialsAfterLastStreamClose(t *testing.T) {
 		return client, nil
 	})
 
-	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0)
+	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0, true)
 	require.NoError(t, err)
 	require.NoError(t, st1.Close())
 	waitWorker(t, s1)
 
-	s2, st2, err := manager.acquire("xiaomi://host?did=1", 0)
+	s2, st2, err := manager.acquire("xiaomi://host?did=1", 0, true)
 	require.NoError(t, err)
 	require.NotSame(t, s1, s2)
 	require.Len(t, clients, 2)
@@ -298,7 +423,7 @@ func TestSessionManagerConcurrentAcquireClosesDuplicateClient(t *testing.T) {
 	results := make(chan result, 2)
 	for range 2 {
 		go func() {
-			s, st, err := manager.acquire("xiaomi://host?did=1", 0)
+			s, st, err := manager.acquire("xiaomi://host?did=1", 0, true)
 			results <- result{session: s, stream: st, err: err}
 		}()
 	}

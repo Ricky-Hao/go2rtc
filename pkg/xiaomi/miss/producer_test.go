@@ -15,7 +15,6 @@ func TestProbeAddsDefaultSharedAudioMedia(t *testing.T) {
 	s := newSession(newFakeClient(), "key", nil)
 	st := newTestStream(s)
 	st.ch <- testH264Packet(t)
-	closeWhenDrained(st)
 
 	medias, err := probe(st, true)
 	require.NoError(t, err)
@@ -27,6 +26,20 @@ func TestProbeAddsDefaultSharedAudioMedia(t *testing.T) {
 	require.Equal(t, core.KindAudio, medias[2].Kind)
 	require.Equal(t, core.DirectionSendonly, medias[2].Direction)
 	require.Equal(t, core.CodecPCMA, medias[2].Codecs[0].Name)
+}
+
+func TestProbeUsesPCMARecvDefaultForOpusTalk(t *testing.T) {
+	client := newFakeClient()
+	client.speakerCodec = codecOPUS
+	s := newSession(client, "key", nil)
+	st := newTestStream(s)
+	st.ch <- testH264Packet(t)
+
+	medias, err := probe(st, true)
+	require.NoError(t, err)
+	require.Len(t, medias, 3)
+	require.Equal(t, core.CodecPCMA, medias[1].Codecs[0].Name)
+	require.Equal(t, core.CodecOpus, medias[2].Codecs[0].Name)
 }
 
 func TestProbeDoesNotAddSharedAudioMediaWhenDisabled(t *testing.T) {
@@ -43,12 +56,12 @@ func TestProbeDoesNotAddSharedAudioMediaWhenDisabled(t *testing.T) {
 func TestProbeReusesObservedSharedAudioCodec(t *testing.T) {
 	s := newSession(newFakeClient(), "key", nil)
 	st0 := newTestStream(s)
-	st0.ch <- testH264Packet(t)
 	st0.ch <- &Packet{
 		CodecID: codecPCMU,
 		Flags:   1 << 3,
 		Payload: []byte{1, 2, 3, 4},
 	}
+	st0.ch <- testH264Packet(t)
 
 	medias0, err := probe(st0, true)
 	require.NoError(t, err)
@@ -59,7 +72,6 @@ func TestProbeReusesObservedSharedAudioCodec(t *testing.T) {
 
 	st1 := newTestStream(s)
 	st1.ch <- testH264Packet(t)
-	closeWhenDrained(st1)
 
 	medias1, err := probe(st1, true)
 	require.NoError(t, err)

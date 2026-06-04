@@ -30,19 +30,20 @@ func Dial(rawURL string) (core.Producer, error) {
 		return nil, err
 	}
 
-	sess, st, err := defaultSessionManager.acquire(rawURL, channel)
+	audio := query.Get("audio")
+	audioEnabled := audio != "0"
+	sess, st, err := defaultSessionManager.acquire(rawURL, channel, audioEnabled)
 	if err != nil {
 		return nil, err
 	}
 
-	audio := query.Get("audio")
 	err = sess.startMedia(channel, query.Get("subtype"), audio)
 	if err != nil {
 		_ = st.Close()
 		return nil, err
 	}
 
-	medias, err := probe(st, audio != "0")
+	medias, err := probe(st, audioEnabled)
 	if err != nil {
 		_ = st.Close()
 		return nil, err
@@ -113,7 +114,7 @@ func probe(st *stream, audio bool) ([]*core.Media, error) {
 			}
 		}
 
-		if vcodec != nil && (acodec != nil || !audio) {
+		if vcodec != nil {
 			break
 		}
 	}
