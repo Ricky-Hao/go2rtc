@@ -175,6 +175,20 @@ func TestProducerStartResamplesSameSharedAudioCodec(t *testing.T) {
 	require.Equal(t, uint32(2), packets[1].Timestamp)
 }
 
+func TestBackchannelCodecUsesNegotiatedCodecForAnyTrack(t *testing.T) {
+	codec, err := backchannelCodec(
+		&core.Codec{Name: core.CodecPCMA, ClockRate: 8000},
+		&core.Codec{Name: core.CodecAny},
+	)
+	require.NoError(t, err)
+	require.Equal(t, core.CodecPCMA, codec.Name)
+}
+
+func TestBackchannelCodecRejectsUnresolvedAnyTrack(t *testing.T) {
+	_, err := backchannelCodec(nil, &core.Codec{Name: core.CodecAny})
+	require.Error(t, err)
+}
+
 func newTestStream(s *session) *stream {
 	st := &stream{
 		session: s,
