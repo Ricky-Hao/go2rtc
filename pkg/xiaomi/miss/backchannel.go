@@ -1,6 +1,7 @@
 package miss
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -66,6 +67,8 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 				_ = p.stream.session.writeAudio(codecOPUS, pkt.Payload)
 			}
 		}
+	default:
+		return fmt.Errorf("xiaomi: unsupported backchannel codec: %s", track.Codec.Name)
 	}
 
 	sender.HandleRTP(track)

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
 // session manages a single MISS client connection that can serve multiple
@@ -34,6 +36,7 @@ type session struct {
 	speakerOnce sync.Once
 	speakerErr  error
 
+	audioCodec *core.Codec
 	classifier *packetClassifier
 }
 
@@ -267,6 +270,48 @@ func (s *session) writeAudio(codecID uint32, payload []byte) error {
 // speakerCodec returns the speaker codec for the camera model.
 func (s *session) speakerCodec() uint32 {
 	return s.client.SpeakerCodec()
+}
+
+func (s *session) rememberAudioCodec(codec *core.Codec) *core.Codec {
+	if codec == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.audioCodec == nil {
+		s.audioCodec = codec.Clone()
+	}
+	return s.audioCodec.Clone()
+}
+
+func (s *session) cachedAudioCodec() *core.Codec {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.audioCodec == nil {
+		return nil
+	}
+	return s.audioCodec.Clone()
+}
+
+func (s *session) defaultAudioCodec() *core.Codec {
+	switch s.speakerCodec() {
+	case codecOPUS:
+		return &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
+	default:
+		return &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
+	}
+}
+
+func (s *session) talkCodec() *core.Codec {
+	switch s.speakerCodec() {
+	case codecOPUS:
+		return &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
+	default:
+		return &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
+	}
 }
 
 // removeStream removes a stream from the session. If no streams remain, the
