@@ -272,19 +272,25 @@ func (s *session) speakerCodec() uint32 {
 // removeStream removes a stream from the session. If no streams remain, the
 // session is shut down.
 func (s *session) removeStream(st *stream) {
+	var shutdown bool
+
 	s.mu.Lock()
 	if _, ok := s.streams[st]; !ok {
 		s.mu.Unlock()
 		return
 	}
 	delete(s.streams, st)
-	empty := len(s.streams) == 0
+	if len(s.streams) == 0 && s.state == sessionActive {
+		s.state = sessionClosing
+		s.reason = shutdownNoStreams
+		shutdown = true
+	}
 	s.mu.Unlock()
 
 	st.close()
 
-	if empty {
-		s.shutdown(shutdownNoStreams)
+	if shutdown {
+		s.completeShutdown(shutdownNoStreams, nil)
 	}
 }
 
@@ -294,7 +300,10 @@ func (s *session) shutdown(reason shutdownReason) {
 	if !ok {
 		return
 	}
+	s.completeShutdown(reason, streams)
+}
 
+func (s *session) completeShutdown(reason shutdownReason, streams []*stream) {
 	if s.manager != nil {
 		s.manager.remove(s)
 	}

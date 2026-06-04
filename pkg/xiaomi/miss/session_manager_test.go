@@ -258,6 +258,28 @@ func TestSessionManagerRedialsAfterReadError(t *testing.T) {
 	waitWorker(t, s2)
 }
 
+func TestSessionManagerRedialsAfterLastStreamClose(t *testing.T) {
+	var clients []*fakeClient
+	manager := newSessionManager(func(string) (sessionClient, error) {
+		client := newFakeClient()
+		clients = append(clients, client)
+		return client, nil
+	})
+
+	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0)
+	require.NoError(t, err)
+	require.NoError(t, st1.Close())
+	waitWorker(t, s1)
+
+	s2, st2, err := manager.acquire("xiaomi://host?did=1", 0)
+	require.NoError(t, err)
+	require.NotSame(t, s1, s2)
+	require.Len(t, clients, 2)
+
+	require.NoError(t, st2.Close())
+	waitWorker(t, s2)
+}
+
 func TestSessionManagerConcurrentAcquireClosesDuplicateClient(t *testing.T) {
 	created := make(chan *fakeClient, 2)
 	release := make(chan struct{})
