@@ -124,6 +124,24 @@ Final phase order:
 5. introduce session manager and explicit lifecycle
 6. cleanup and validation
 
+### Preserve current integration surfaces
+
+The refactor should keep the existing `Producer.Stop -> core.Connection.Stop ->
+stream.Close -> session.removeStream` ownership chain. Do not move `StopMedia`
+directly into `Producer.Stop`; MISS sessions can be shared by multiple streams,
+so the session should continue to decide when the last stream has gone away.
+
+The existing backchannel path calls session methods through
+`p.stream.session.startSpeaker`, `writeAudio`, and `speakerCodec`. Keep those
+session-level methods available, and make the test client seam cover them
+instead of adding a separate producer/backchannel abstraction in this refactor.
+
+The current README documents `channel=2` for the second Xiaomi channel, while
+the current code also has behavior around channel index `1`. The refactor must
+centralize channel parsing and preserve compatibility by accepting both the
+documented user-facing value (`channel=2`) and the existing internal/test value
+(`channel=1`) as requests for second channel `1`.
+
 ## Key invariants
 
 ### Lock ordering
@@ -379,6 +397,7 @@ Required characterization tests:
 4. no-stream shutdown attempts bounded `StopMedia`
 5. single-channel to dual-channel upgrade calls `StartMediaDual`
 6. `StartMediaDual` failure does not mark the second channel started
+7. `channel=2` and `channel=1` both select internal channel `1`
 
 ### Acceptance
 
@@ -479,6 +498,8 @@ Required lifecycle tests:
 10. first shutdown reason wins
 11. redial after read-error creates a fresh session
 12. worker exits before shutdown returns
+13. shared-session shutdown still happens through `stream.Close`, preserving
+    the current `Producer.Stop -> core.Connection.Stop` ownership path
 
 ### Acceptance
 
