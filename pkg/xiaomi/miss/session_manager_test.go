@@ -359,6 +359,11 @@ func TestParseChannel(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestDialRejectsMalformedURL(t *testing.T) {
+	_, err := Dial("xiaomi://%zz")
+	require.Error(t, err)
+}
+
 func waitWorker(t *testing.T, s *session) {
 	t.Helper()
 

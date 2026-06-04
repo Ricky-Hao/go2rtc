@@ -19,7 +19,10 @@ type Producer struct {
 }
 
 func Dial(rawURL string) (core.Producer, error) {
-	u, _ := url.Parse(rawURL)
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
 	query := u.Query()
 	channel, err := parseChannel(query)
 	if err != nil {
