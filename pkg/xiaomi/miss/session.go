@@ -60,6 +60,8 @@ var (
 	sessions  = map[string]*session{}
 )
 
+const stopMediaTimeout = time.Second
+
 // sessionKey builds a cache key from the URL. Two URLs pointing to the same
 // camera (same host and did) will share a session.
 func sessionKey(rawURL string) (string, error) {
@@ -99,21 +101,11 @@ func getOrCreateSession(rawURL string) (*session, error) {
 		return nil, err
 	}
 
+	s := newSession(client, key)
+
 	// Dafang-like models: no session sharing, return standalone session.
 	if client.IsDafangLike() {
-		return &session{
-			client:      client,
-			key:         key,
-			streams:     make(map[*stream]struct{}),
-			resolutions: make(map[uint32]uint8),
-		}, nil
-	}
-
-	s := &session{
-		client:      client,
-		key:         key,
-		streams:     make(map[*stream]struct{}),
-		resolutions: make(map[uint32]uint8),
+		return s, nil
 	}
 
 	sessionMu.Lock()
@@ -127,6 +119,15 @@ func getOrCreateSession(rawURL string) (*session, error) {
 	sessionMu.Unlock()
 
 	return s, nil
+}
+
+func newSession(client *Client, key string) *session {
+	return &session{
+		client:      client,
+		key:         key,
+		streams:     make(map[*stream]struct{}),
+		resolutions: make(map[uint32]uint8),
+	}
 }
 
 // openStream creates a new stream for the given channel on this session.
@@ -201,7 +202,7 @@ func (s *session) worker() {
 
 		pkt, err := s.client.ReadPacket()
 		if err != nil {
-			s.shutdown()
+			s.shutdown(false)
 			return
 		}
 
@@ -433,37 +434,62 @@ func (s *session) removeStream(st *stream) {
 	st.close()
 
 	if empty {
-		s.shutdown()
+		s.shutdown(true)
 	}
 }
 
 // shutdown tears down the session, closing all streams and the client.
-func (s *session) shutdown() {
+func (s *session) shutdown(stopMedia bool) {
 	s.closeOnce.Do(func() {
-		s.mu.Lock()
-		streams := make([]*stream, 0, len(s.streams))
-		for st := range s.streams {
-			streams = append(streams, st)
-		}
-		s.streams = make(map[*stream]struct{})
-		s.mu.Unlock()
+		s.removeFromCache()
 
-		for _, st := range streams {
+		for _, st := range s.closeStreams() {
 			st.close()
 		}
 
-		// Send VideoStop before closing so the camera releases the
-		// connection slot. Without this, the camera may think the
-		// session is still active and refuse new connections.
-		_ = s.client.StopMedia()
-		_ = s.client.Close()
-
-		sessionMu.Lock()
-		if sessions[s.key] == s {
-			delete(sessions, s.key)
+		if stopMedia {
+			s.stopMedia()
 		}
-		sessionMu.Unlock()
+		_ = s.client.Close()
 	})
+}
+
+func (s *session) removeFromCache() {
+	sessionMu.Lock()
+	if sessions[s.key] == s {
+		delete(sessions, s.key)
+	}
+	sessionMu.Unlock()
+}
+
+func (s *session) closeStreams() []*stream {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	streams := make([]*stream, 0, len(s.streams))
+	for st := range s.streams {
+		streams = append(streams, st)
+	}
+	s.streams = make(map[*stream]struct{})
+	return streams
+}
+
+func (s *session) stopMedia() {
+	_ = s.client.SetDeadline(time.Now().Add(stopMediaTimeout))
+
+	done := make(chan struct{})
+	go func() {
+		_ = s.client.StopMedia()
+		close(done)
+	}()
+
+	timer := time.NewTimer(stopMediaTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 // --- stream methods ---

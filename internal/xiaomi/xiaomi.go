@@ -67,13 +67,40 @@ type missCred struct {
 	sign          string
 	vendor        string
 	uid           string // only for TUTK
-	created       time.Time
+	expiresAt     time.Time
 }
 
+// Keep MISS credentials short-lived: they are only meant to bridge the
+// near-simultaneous startup of dual-channel streams, not later reconnects.
 const missCredTTL = 30 * time.Second
 
 var missCreds = map[string]missCred{}
 var missCredsMu sync.Mutex
+
+func getMissCred(key string) (missCred, bool) {
+	now := time.Now()
+
+	missCredsMu.Lock()
+	defer missCredsMu.Unlock()
+
+	cred, ok := missCreds[key]
+	if !ok {
+		return missCred{}, false
+	}
+	if !now.Before(cred.expiresAt) {
+		delete(missCreds, key)
+		return missCred{}, false
+	}
+	return cred, true
+}
+
+func setMissCred(key string, cred missCred) {
+	cred.expiresAt = time.Now().Add(missCredTTL)
+
+	missCredsMu.Lock()
+	missCreds[key] = cred
+	missCredsMu.Unlock()
+}
 
 func getCloud(userID string) (*xiaomi.Cloud, error) {
 	cloudsMu.Lock()
@@ -175,9 +202,7 @@ func getMissURL(url *url.URL) (string, error) {
 	// Check credential cache first. The second channel of a dual-channel
 	// camera can reuse the same credentials without a cloud API call.
 	cacheKey := url.User.Username() + ":" + region + ":" + query.Get("did")
-	missCredsMu.Lock()
-	if cred, ok := missCreds[cacheKey]; ok && time.Since(cred.created) < missCredTTL {
-		missCredsMu.Unlock()
+	if cred, ok := getMissCred(cacheKey); ok {
 		query.Set("client_public", cred.clientPublic)
 		query.Set("client_private", cred.clientPrivate)
 		query.Set("device_public", cred.devicePublic)
@@ -189,7 +214,6 @@ func getMissURL(url *url.URL) (string, error) {
 		url.RawQuery = query.Encode()
 		return url.String(), nil
 	}
-	missCredsMu.Unlock()
 
 	clientPublic, clientPrivate, err := crypto.GenerateKey()
 	if err != nil {
@@ -240,17 +264,14 @@ func getMissURL(url *url.URL) (string, error) {
 	}
 
 	// Cache the credentials for dual-channel reuse.
-	missCredsMu.Lock()
-	missCreds[cacheKey] = missCred{
+	setMissCred(cacheKey, missCred{
 		clientPublic:  cpub,
 		clientPrivate: cpriv,
 		devicePublic:  v.PublicKey,
 		sign:          v.Sign,
 		vendor:        vendor,
 		uid:           uid,
-		created:       time.Now(),
-	}
-	missCredsMu.Unlock()
+	})
 
 	url.RawQuery = query.Encode()
 	return url.String(), nil
