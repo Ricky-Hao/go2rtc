@@ -25,7 +25,7 @@ func newSessionManager(newClient clientFactory) *sessionManager {
 	}
 }
 
-func (m *sessionManager) acquire(rawURL string, channel uint8, audio bool) (*session, *stream, error) {
+func (m *sessionManager) acquire(rawURL string, channel uint8, audio audioMode) (*session, *stream, error) {
 	key, err := sessionKey(rawURL)
 	if err != nil {
 		return nil, nil, err
@@ -85,7 +85,7 @@ func (m *sessionManager) acquire(rawURL string, channel uint8, audio bool) (*ses
 	return s, st, nil
 }
 
-func (m *sessionManager) acquireExisting(key string, channel uint8, audio bool) (*session, *stream, bool) {
+func (m *sessionManager) acquireExisting(key string, channel uint8, audio audioMode) (*session, *stream, bool) {
 	m.mu.Lock()
 	s, ok := m.sessions[key]
 	if !ok {

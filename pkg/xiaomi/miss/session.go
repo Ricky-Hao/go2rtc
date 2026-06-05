@@ -27,9 +27,10 @@ type session struct {
 	reason  shutdownReason
 
 	// startedMask tracks which channels have been started (bit 0 = ch0, bit 1 = ch1).
-	startedMask uint8
-	quality     [2]string // remembered quality per channel
-	mediaAudio  bool
+	startedMask  uint8
+	quality      [2]string // remembered quality per channel
+	mediaAudio   bool
+	audioStarted bool
 
 	workerOnce sync.Once
 	workerDone chan struct{}
@@ -47,7 +48,7 @@ type session struct {
 type stream struct {
 	session *session
 	channel uint8
-	audio   bool
+	audio   audioMode
 	ch      chan *Packet
 
 	closeOnce sync.Once
@@ -61,6 +62,7 @@ type sessionClient interface {
 	IsDafangLike() bool
 	StartMedia(channel, quality, audio string) error
 	StartMediaDual(quality0, quality1, audio string) error
+	StartAudio() error
 	StopMedia() error
 	StartSpeaker() error
 	SpeakerCodec() uint32
@@ -93,6 +95,29 @@ const (
 
 var errSessionClosing = errors.New("miss: session is closing")
 
+type audioMode uint8
+
+const (
+	audioDisabled audioMode = iota
+	audioVideoStart
+	audioCommandStart
+)
+
+func parseAudioMode(raw string) audioMode {
+	switch raw {
+	case "0":
+		return audioDisabled
+	case "2":
+		return audioCommandStart
+	default:
+		return audioVideoStart
+	}
+}
+
+func (m audioMode) enabled() bool {
+	return m != audioDisabled
+}
+
 // sessionKey builds a cache key from the URL. Two URLs pointing to the same
 // camera (same host and did) will share a session.
 func sessionKey(rawURL string) (string, error) {
@@ -120,7 +145,7 @@ func newSession(client sessionClient, key string, manager *sessionManager) *sess
 }
 
 // openStream creates a new stream for the given channel on this session.
-func (s *session) openStream(channel uint8, audio bool) (*stream, error) {
+func (s *session) openStream(channel uint8, audio audioMode) (*stream, error) {
 	s.mu.Lock()
 	st, err := s.openStreamLocked(channel, audio)
 	s.mu.Unlock()
@@ -132,7 +157,7 @@ func (s *session) openStream(channel uint8, audio bool) (*stream, error) {
 }
 
 // openStreamLocked creates a new stream while s.mu is held.
-func (s *session) openStreamLocked(channel uint8, audio bool) (*stream, error) {
+func (s *session) openStreamLocked(channel uint8, audio audioMode) (*stream, error) {
 	if s.state != sessionActive {
 		return nil, errSessionClosing
 	}
@@ -173,6 +198,9 @@ func (s *session) startMedia(channel uint8, quality, _ string) error {
 		if !s.mediaAudio && s.audioEnabledLocked() {
 			return s.enableAudioLocked()
 		}
+		if s.shouldStartAudioLocked() {
+			s.startAudioLocked()
+		}
 		return nil
 	}
 
@@ -190,6 +218,9 @@ func (s *session) startMedia(channel uint8, quality, _ string) error {
 		}
 		s.startedMask |= 1 << ch
 		s.mediaAudio = audio != "0"
+		if s.shouldStartAudioLocked() {
+			s.startAudioLocked()
+		}
 		return nil
 	}
 
@@ -203,12 +234,24 @@ func (s *session) startMedia(channel uint8, quality, _ string) error {
 	}
 	s.startedMask |= 1 << ch
 	s.mediaAudio = audio != "0"
+	if s.shouldStartAudioLocked() {
+		s.startAudioLocked()
+	}
 	return nil
 }
 
 func (s *session) audioEnabledLocked() bool {
 	for st := range s.streams {
-		if st.audio {
+		if st.audio.enabled() {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *session) audioCommandEnabledLocked() bool {
+	for st := range s.streams {
+		if st.audio == audioCommandStart {
 			return true
 		}
 	}
@@ -241,7 +284,22 @@ func (s *session) enableAudioLocked() error {
 		return err
 	}
 	s.mediaAudio = true
+	if s.shouldStartAudioLocked() {
+		s.startAudioLocked()
+	}
 	return nil
+}
+
+func (s *session) shouldStartAudioLocked() bool {
+	if s.audioStarted || s.client.IsDafangLike() || !s.audioEnabledLocked() {
+		return false
+	}
+	return s.startedMask == 0b11 || s.audioCommandEnabledLocked()
+}
+
+func (s *session) startAudioLocked() {
+	_ = s.client.StartAudio()
+	s.audioStarted = true
 }
 
 func channelString(channel uint8) string {
