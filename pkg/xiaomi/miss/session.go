@@ -28,6 +28,7 @@ type session struct {
 
 	// startedMask tracks which channels have been started (bit 0 = ch0, bit 1 = ch1).
 	startedMask  uint8
+	restartMask  uint8
 	quality      [2]string // remembered quality per channel
 	mediaAudio   bool
 	audioStarted bool
@@ -193,8 +194,14 @@ func (s *session) startMedia(channel uint8, quality, _ string) error {
 		ch = 0
 	}
 
+	bit := channelBit(uint8(ch))
+
 	// Already started this channel.
-	if s.startedMask&(1<<ch) != 0 {
+	if s.startedMask&bit != 0 {
+		if s.restartMask&bit != 0 {
+			s.quality[ch] = quality
+			return s.restartMediaLocked(uint8(ch))
+		}
 		if !s.mediaAudio && s.audioEnabledLocked() {
 			return s.enableAudioLocked()
 		}
@@ -240,6 +247,37 @@ func (s *session) startMedia(channel uint8, quality, _ string) error {
 	return nil
 }
 
+func channelBit(channel uint8) uint8 {
+	if channel == 1 {
+		return 0b10
+	}
+	return 0b01
+}
+
+func (s *session) restartMediaLocked(channel uint8) error {
+	bit := channelBit(channel)
+	other := channel ^ 1
+	audio := s.audioParamLocked()
+
+	var err error
+	if s.startedMask&channelBit(other) != 0 && s.hasChannelLocked(other) {
+		err = s.client.StartMediaDual(s.quality[0], s.quality[1], audio)
+	} else {
+		err = s.client.StartMedia(channelString(channel), s.quality[channel], audio)
+	}
+	if err != nil {
+		return err
+	}
+
+	s.restartMask &^= bit
+	s.mediaAudio = audio != "0"
+	s.audioStarted = false
+	if s.shouldStartAudioLocked() {
+		s.startAudioLocked()
+	}
+	return nil
+}
+
 func (s *session) audioEnabledLocked() bool {
 	for st := range s.streams {
 		if st.audio.enabled() {
@@ -252,6 +290,15 @@ func (s *session) audioEnabledLocked() bool {
 func (s *session) audioCommandEnabledLocked() bool {
 	for st := range s.streams {
 		if st.audio == audioCommandStart {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *session) hasChannelLocked(channel uint8) bool {
+	for st := range s.streams {
+		if st.channel == channel {
 			return true
 		}
 	}
@@ -445,6 +492,8 @@ func (s *session) removeStream(st *stream) {
 		s.state = sessionClosing
 		s.reason = shutdownNoStreams
 		shutdown = true
+	} else if s.state == sessionActive && !s.hasChannelLocked(st.channel) {
+		s.restartMask |= channelBit(st.channel)
 	}
 	s.mu.Unlock()
 
