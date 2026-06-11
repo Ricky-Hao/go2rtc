@@ -114,6 +114,7 @@ jobs:
 
   docker-master:
     name: Build docker master
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -171,6 +172,7 @@ jobs:
 
   docker-hardware:
     name: Build docker hardware
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -226,6 +228,7 @@ jobs:
 
   docker-rockchip:
     name: Build docker rockchip
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

@@ -1,6 +1,7 @@
 package miss
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -9,22 +10,27 @@ import (
 	"github.com/pion/rtp"
 )
 
-func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiver) error {
+func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
 	if err := p.stream.session.startSpeaker(); err != nil {
 		return err
 	}
 	// TODO: check this!!!
 	time.Sleep(time.Second)
 
-	sender := core.NewSender(media, track.Codec)
+	sourceCodec, err := backchannelCodec(codec, track.Codec)
+	if err != nil {
+		return err
+	}
 
-	switch track.Codec.Name {
+	sender := core.NewSender(media, sourceCodec)
+
+	switch sourceCodec.Name {
 	case core.CodecPCMA:
 		var buf []byte
 
 		if p.stream.session.speakerCodec() == codecPCM {
 			dst := &core.Codec{Name: core.CodecPCML, ClockRate: 8000}
-			transcode := pcm.Transcode(dst, track.Codec)
+			transcode := pcm.Transcode(dst, sourceCodec)
 
 			sender.Handler = func(pkt *rtp.Packet) {
 				buf = append(buf, transcode(pkt.Payload)...)
@@ -66,9 +72,39 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 				_ = p.stream.session.writeAudio(codecOPUS, pkt.Payload)
 			}
 		}
+	default:
+		return fmt.Errorf("xiaomi: unsupported backchannel codec: %s", sourceCodec.Name)
 	}
 
 	sender.HandleRTP(track)
 	p.Senders = append(p.Senders, sender)
 	return nil
+}
+
+func backchannelCodec(negotiated, track *core.Codec) (*core.Codec, error) {
+	if isSpecificCodec(negotiated) {
+		return negotiated, nil
+	}
+	if isSpecificCodec(track) {
+		return track, nil
+	}
+	return nil, fmt.Errorf("xiaomi: unsupported backchannel codec: %s", codecName(track))
+}
+
+func isSpecificCodec(codec *core.Codec) bool {
+	if codec == nil {
+		return false
+	}
+	switch codec.Name {
+	case "", core.CodecAny, core.CodecAll:
+		return false
+	}
+	return true
+}
+
+func codecName(codec *core.Codec) string {
+	if codec == nil {
+		return "<nil>"
+	}
+	return codec.Name
 }

@@ -1,6 +1,7 @@
 package miss
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/url"
@@ -8,9 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/AlexxIT/go2rtc/pkg/h264"
-	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
-	"github.com/AlexxIT/go2rtc/pkg/h265"
+	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
 // session manages a single MISS client connection that can serve multiple
@@ -18,28 +17,29 @@ import (
 // share the same underlying UDP/TCP session to avoid exhausting the camera's
 // limited connection slots.
 type session struct {
-	client *Client
-	key    string // cache key: host|did
+	client  sessionClient
+	key     string // cache key: host|did
+	manager *sessionManager
 
 	mu      sync.Mutex
 	streams map[*stream]struct{}
+	state   sessionState
+	reason  shutdownReason
 
 	// startedMask tracks which channels have been started (bit 0 = ch0, bit 1 = ch1).
-	startedMask uint8
-	quality     [2]string // remembered quality per channel
+	startedMask  uint8
+	quality      [2]string // remembered quality per channel
+	mediaAudio   bool
+	audioStarted bool
 
 	workerOnce sync.Once
-	closeOnce  sync.Once
+	workerDone chan struct{}
 
 	speakerOnce sync.Once
 	speakerErr  error
 
-	// Channel classification state (protected by mu).
-	hdrChanSeen   [2]bool          // hdr[28] values seen
-	flagsChanSeen [2]bool          // (flags >> 24) values seen
-	resolutions   map[uint32]uint8 // resolution area → channel
-	lastTS        [2]uint64        // last timestamp per channel
-	tsInit        [2]bool          // whether lastTS is initialized
+	audioCodec *core.Codec
+	classifier *packetClassifier
 }
 
 // stream represents a single channel's view of a session. It receives
@@ -48,6 +48,7 @@ type session struct {
 type stream struct {
 	session *session
 	channel uint8
+	audio   audioMode
 	ch      chan *Packet
 
 	closeOnce sync.Once
@@ -55,12 +56,67 @@ type stream struct {
 	done      chan struct{}
 }
 
-var (
-	sessionMu sync.Mutex
-	sessions  = map[string]*session{}
+type sessionClient interface {
+	Protocol() string
+	Version() string
+	IsDafangLike() bool
+	StartMedia(channel, quality, audio string) error
+	StartMediaDual(quality0, quality1, audio string) error
+	StartAudio() error
+	StopMedia() error
+	StartSpeaker() error
+	SpeakerCodec() uint32
+	WriteAudio(codecID uint32, payload []byte) error
+	ReadPacket() (*Packet, error)
+	RemoteAddr() net.Addr
+	SetDeadline(t time.Time) error
+	Close() error
+}
+
+type sessionState uint8
+
+const (
+	sessionActive sessionState = iota
+	sessionClosing
+	sessionClosed
 )
 
-const stopMediaTimeout = time.Second
+type shutdownReason uint8
+
+const (
+	shutdownReadError shutdownReason = iota
+	shutdownNoStreams
+)
+
+const (
+	stopMediaTimeout  = time.Second
+	workerStopTimeout = time.Second
+)
+
+var errSessionClosing = errors.New("miss: session is closing")
+
+type audioMode uint8
+
+const (
+	audioDisabled audioMode = iota
+	audioVideoStart
+	audioCommandStart
+)
+
+func parseAudioMode(raw string) audioMode {
+	switch raw {
+	case "0":
+		return audioDisabled
+	case "2":
+		return audioCommandStart
+	default:
+		return audioVideoStart
+	}
+}
+
+func (m audioMode) enabled() bool {
+	return m != audioDisabled
+}
 
 // sessionKey builds a cache key from the URL. Two URLs pointing to the same
 // camera (same host and did) will share a session.
@@ -76,85 +132,59 @@ func sessionKey(rawURL string) (string, error) {
 	return key, nil
 }
 
-// getOrCreateSession returns an existing session for the camera or creates a
-// new one. Dafang-like models that don't support dual-channel always get a
-// fresh client (no session sharing).
-func getOrCreateSession(rawURL string) (*session, error) {
-	key, err := sessionKey(rawURL)
-	if err != nil {
-		return nil, err
-	}
-
-	sessionMu.Lock()
-	if s, ok := sessions[key]; ok {
-		// Reuse existing session only if the underlying client supports
-		// dual-channel (not dafang-like).
-		if !s.client.IsDafangLike() {
-			sessionMu.Unlock()
-			return s, nil
-		}
-	}
-	sessionMu.Unlock()
-
-	client, err := NewClient(rawURL)
-	if err != nil {
-		return nil, err
-	}
-
-	s := newSession(client, key)
-
-	// Dafang-like models: no session sharing, return standalone session.
-	if client.IsDafangLike() {
-		return s, nil
-	}
-
-	sessionMu.Lock()
-	if existing, ok := sessions[key]; ok {
-		// Another goroutine created it between our check and now.
-		sessionMu.Unlock()
-		_ = client.Close()
-		return existing, nil
-	}
-	sessions[key] = s
-	sessionMu.Unlock()
-
-	return s, nil
-}
-
-func newSession(client *Client, key string) *session {
+func newSession(client sessionClient, key string, manager *sessionManager) *session {
 	return &session{
-		client:      client,
-		key:         key,
-		streams:     make(map[*stream]struct{}),
-		resolutions: make(map[uint32]uint8),
+		client:     client,
+		key:        key,
+		manager:    manager,
+		streams:    make(map[*stream]struct{}),
+		state:      sessionActive,
+		workerDone: make(chan struct{}),
+		classifier: newPacketClassifier(),
 	}
 }
 
 // openStream creates a new stream for the given channel on this session.
-func (s *session) openStream(channel uint8) *stream {
+func (s *session) openStream(channel uint8, audio audioMode) (*stream, error) {
+	s.mu.Lock()
+	st, err := s.openStreamLocked(channel, audio)
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	s.startWorker()
+	return st, nil
+}
+
+// openStreamLocked creates a new stream while s.mu is held.
+func (s *session) openStreamLocked(channel uint8, audio audioMode) (*stream, error) {
+	if s.state != sessionActive {
+		return nil, errSessionClosing
+	}
+
 	st := &stream{
 		session: s,
 		channel: channel,
+		audio:   audio,
 		ch:      make(chan *Packet, 100),
 		done:    make(chan struct{}),
 	}
 	st.deadline.Store(time.Time{})
 
-	s.mu.Lock()
 	s.streams[st] = struct{}{}
-	s.mu.Unlock()
+	return st, nil
+}
 
+func (s *session) startWorker() {
 	s.workerOnce.Do(func() {
 		go s.worker()
 	})
-
-	return st
 }
 
 // startMedia sends the appropriate VideoStart command. If only one channel is
 // active, it sends a single-channel command. If both channels are active, it
 // sends a dual-channel command.
-func (s *session) startMedia(channel uint8, quality, audio string) error {
+func (s *session) startMedia(channel uint8, quality, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -165,11 +195,18 @@ func (s *session) startMedia(channel uint8, quality, audio string) error {
 
 	// Already started this channel.
 	if s.startedMask&(1<<ch) != 0 {
+		if !s.mediaAudio && s.audioEnabledLocked() {
+			return s.enableAudioLocked()
+		}
+		if s.shouldStartAudioLocked() {
+			s.startAudioLocked()
+		}
 		return nil
 	}
 
 	s.quality[ch] = quality
 	other := ch ^ 1
+	audio := s.audioParamLocked()
 
 	// If the other channel is already started, upgrade to dual-channel.
 	if s.startedMask&(1<<other) != 0 {
@@ -180,6 +217,10 @@ func (s *session) startMedia(channel uint8, quality, audio string) error {
 			return err
 		}
 		s.startedMask |= 1 << ch
+		s.mediaAudio = audio != "0"
+		if s.shouldStartAudioLocked() {
+			s.startAudioLocked()
+		}
 		return nil
 	}
 
@@ -192,17 +233,92 @@ func (s *session) startMedia(channel uint8, quality, audio string) error {
 		return err
 	}
 	s.startedMask |= 1 << ch
+	s.mediaAudio = audio != "0"
+	if s.shouldStartAudioLocked() {
+		s.startAudioLocked()
+	}
 	return nil
+}
+
+func (s *session) audioEnabledLocked() bool {
+	for st := range s.streams {
+		if st.audio.enabled() {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *session) audioCommandEnabledLocked() bool {
+	for st := range s.streams {
+		if st.audio == audioCommandStart {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *session) audioParamLocked() string {
+	if s.audioEnabledLocked() {
+		return "1"
+	}
+	return "0"
+}
+
+func (s *session) enableAudioLocked() error {
+	if s.startedMask == 0 {
+		return nil
+	}
+
+	var err error
+	if s.startedMask == 0b11 {
+		err = s.client.StartMediaDual(s.quality[0], s.quality[1], "1")
+	} else {
+		ch := uint8(0)
+		if s.startedMask&0b10 != 0 {
+			ch = 1
+		}
+		err = s.client.StartMedia(channelString(ch), s.quality[ch], "1")
+	}
+	if err != nil {
+		return err
+	}
+	s.mediaAudio = true
+	if s.shouldStartAudioLocked() {
+		s.startAudioLocked()
+	}
+	return nil
+}
+
+func (s *session) shouldStartAudioLocked() bool {
+	if s.audioStarted || s.client.IsDafangLike() || !s.audioEnabledLocked() {
+		return false
+	}
+	return s.startedMask == 0b11 || s.audioCommandEnabledLocked()
+}
+
+func (s *session) startAudioLocked() {
+	_ = s.client.StartAudio()
+	s.audioStarted = true
+}
+
+func channelString(channel uint8) string {
+	if channel == 1 {
+		return "1"
+	}
+	return "0"
 }
 
 // worker is the read loop that dispatches packets to streams.
 func (s *session) worker() {
+	defer close(s.workerDone)
+
 	for {
 		_ = s.client.SetDeadline(time.Now().Add(10 * time.Second))
 
 		pkt, err := s.client.ReadPacket()
 		if err != nil {
-			s.shutdown(false)
+			s.shutdown(shutdownReadError)
 			return
 		}
 
@@ -232,17 +348,24 @@ func (s *session) dispatch(pkt *Packet) {
 		return
 	}
 
-	// Single stream: send all video to it, no classification needed.
-	if len(streams) == 1 {
+	// Single stream before dual mode: send all video to it, no classification needed.
+	if len(streams) == 1 && s.startedMask != 0b11 {
 		s.mu.Unlock()
 		streams[0].push(pkt)
 		return
 	}
 
+	if len(streams) == 1 {
+		ch, ok := s.classifier.ClassifyKnown(pkt)
+		s.mu.Unlock()
+		if !ok || streams[0].channel == ch {
+			streams[0].push(pkt)
+		}
+		return
+	}
+
 	// Multiple streams: classify and route. Already holding mu.
-	ch := s.classifyPacket(pkt)
-	s.lastTS[ch] = pkt.Timestamp
-	s.tsInit[ch] = true
+	ch := s.classifier.Classify(pkt)
 	s.mu.Unlock()
 
 	for _, st := range streams {
@@ -250,155 +373,6 @@ func (s *session) dispatch(pkt *Packet) {
 			st.push(pkt)
 		}
 	}
-}
-
-// classifyPacket runs through classification strategies in priority order.
-// Must be called with s.mu held.
-func (s *session) classifyPacket(pkt *Packet) uint8 {
-	// Strategy 1: hdr[28] channel field.
-	// Trusted only after seeing both 0 and 1.
-	if pkt.ChannelOK {
-		s.hdrChanSeen[pkt.Channel] = true
-		if s.hdrChanSeen[0] && s.hdrChanSeen[1] {
-			return pkt.Channel
-		}
-	}
-
-	// Strategy 2: (flags >> 24) & 0x01.
-	fch := pkt.FlagsChannel
-	s.flagsChanSeen[fch] = true
-	if s.flagsChanSeen[0] && s.flagsChanSeen[1] {
-		return fch
-	}
-
-	// Strategy 3: Resolution from SPS in keyframes.
-	if ch, ok := s.classifyByResolution(pkt); ok {
-		return ch
-	}
-
-	// Strategy 4: Timestamp continuity.
-	if s.tsInit[0] && s.tsInit[1] {
-		return s.classifyByTimestamp(pkt)
-	}
-
-	return 0
-}
-
-// classifyByTimestamp routes by closest preceding timestamp.
-func (s *session) classifyByTimestamp(pkt *Packet) uint8 {
-	ts := pkt.Timestamp
-
-	if ts == s.lastTS[0] {
-		return 0
-	}
-	if ts == s.lastTS[1] {
-		return 1
-	}
-
-	var d0, d1 uint64
-	if ts >= s.lastTS[0] {
-		d0 = ts - s.lastTS[0]
-	} else {
-		d0 = ^uint64(0)
-	}
-	if ts >= s.lastTS[1] {
-		d1 = ts - s.lastTS[1]
-	} else {
-		d1 = ^uint64(0)
-	}
-
-	if d0 <= d1 {
-		return 0
-	}
-	return 1
-}
-
-// classifyByResolution uses SPS from keyframes to map resolution → channel.
-// Higher resolution = channel 0, lower = channel 1.
-func (s *session) classifyByResolution(pkt *Packet) (uint8, bool) {
-	area := videoResolutionArea(pkt)
-	if area == 0 {
-		return 0, false
-	}
-
-	if ch, ok := s.resolutions[area]; ok {
-		return ch, true
-	}
-
-	s.assignResolution(area)
-	if ch, ok := s.resolutions[area]; ok {
-		return ch, true
-	}
-	return 0, false
-}
-
-// assignResolution adds a resolution and assigns channels.
-// Higher resolution → channel 0, lower → channel 1.
-func (s *session) assignResolution(newArea uint32) {
-	s.resolutions[newArea] = 0
-
-	if len(s.resolutions) < 2 {
-		return
-	}
-
-	var maxArea uint32
-	for area := range s.resolutions {
-		if area > maxArea {
-			maxArea = area
-		}
-	}
-
-	for area := range s.resolutions {
-		if area == maxArea {
-			s.resolutions[area] = 0
-		} else {
-			s.resolutions[area] = 1
-		}
-	}
-}
-
-// videoResolutionArea extracts width*height from H264/H265 SPS in a keyframe.
-func videoResolutionArea(pkt *Packet) uint32 {
-	switch pkt.CodecID {
-	case codecH264:
-		avcc := annexb.EncodeToAVCC(pkt.Payload)
-		if h264.NALUType(avcc) == h264.NALUTypeSPS {
-			sps := h264.DecodeSPS(avcc[4:]) // skip 4-byte AVCC length prefix
-			if sps != nil {
-				return uint32(sps.Width()) * uint32(sps.Height())
-			}
-		}
-	case codecH265:
-		avcc := annexb.EncodeToAVCC(pkt.Payload)
-		if h265.NALUType(avcc) == h265.NALUTypeVPS {
-			// H265 keyframes start with VPS, then SPS. Find the SPS.
-			spsData := findH265SPS(avcc)
-			if spsData != nil {
-				sps := h265.DecodeSPS(spsData)
-				if sps != nil {
-					return uint32(sps.Width()) * uint32(sps.Height())
-				}
-			}
-		}
-	}
-	return 0
-}
-
-// findH265SPS searches for an SPS NALU in AVCC-formatted H265 data.
-func findH265SPS(avcc []byte) []byte {
-	for i := 0; i+4 < len(avcc); {
-		size := int(avcc[i])<<24 | int(avcc[i+1])<<16 | int(avcc[i+2])<<8 | int(avcc[i+3])
-		i += 4
-		if size <= 0 || i+size > len(avcc) {
-			break
-		}
-		naluType := (avcc[i] >> 1) & 0x3F
-		if naluType == h265.NALUTypeSPS {
-			return avcc[i : i+size]
-		}
-		i += size
-	}
-	return nil
 }
 
 // startSpeaker starts the speaker on the session (once).
@@ -419,59 +393,124 @@ func (s *session) speakerCodec() uint32 {
 	return s.client.SpeakerCodec()
 }
 
+func (s *session) rememberAudioCodec(codec *core.Codec) *core.Codec {
+	if codec == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.audioCodec == nil {
+		s.audioCodec = codec.Clone()
+	}
+	return s.audioCodec.Clone()
+}
+
+func (s *session) cachedAudioCodec() *core.Codec {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.audioCodec == nil {
+		return nil
+	}
+	return s.audioCodec.Clone()
+}
+
+func (s *session) defaultAudioCodec() *core.Codec {
+	return &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
+}
+
+func (s *session) talkCodec() *core.Codec {
+	switch s.speakerCodec() {
+	case codecOPUS:
+		return &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
+	default:
+		return &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
+	}
+}
+
 // removeStream removes a stream from the session. If no streams remain, the
 // session is shut down.
 func (s *session) removeStream(st *stream) {
+	var shutdown bool
+
 	s.mu.Lock()
 	if _, ok := s.streams[st]; !ok {
 		s.mu.Unlock()
 		return
 	}
 	delete(s.streams, st)
-	empty := len(s.streams) == 0
+	if len(s.streams) == 0 && s.state == sessionActive {
+		s.state = sessionClosing
+		s.reason = shutdownNoStreams
+		shutdown = true
+	}
 	s.mu.Unlock()
 
 	st.close()
 
-	if empty {
-		s.shutdown(true)
+	if shutdown {
+		s.completeShutdown(shutdownNoStreams, nil)
 	}
 }
 
 // shutdown tears down the session, closing all streams and the client.
-func (s *session) shutdown(stopMedia bool) {
-	s.closeOnce.Do(func() {
-		s.removeFromCache()
-
-		for _, st := range s.closeStreams() {
-			st.close()
-		}
-
-		if stopMedia {
-			s.stopMedia()
-		}
-		_ = s.client.Close()
-	})
-}
-
-func (s *session) removeFromCache() {
-	sessionMu.Lock()
-	if sessions[s.key] == s {
-		delete(sessions, s.key)
+func (s *session) shutdown(reason shutdownReason) {
+	streams, ok := s.beginShutdown(reason)
+	if !ok {
+		return
 	}
-	sessionMu.Unlock()
+	s.completeShutdown(reason, streams)
 }
 
-func (s *session) closeStreams() []*stream {
+func (s *session) completeShutdown(reason shutdownReason, streams []*stream) {
+	if s.manager != nil {
+		s.manager.remove(s)
+	}
+
+	for _, st := range streams {
+		st.close()
+	}
+
+	if reason == shutdownNoStreams {
+		s.stopMedia()
+	}
+	_ = s.client.Close()
+
+	if reason == shutdownNoStreams {
+		s.waitWorkerDone()
+	}
+
+	s.finishShutdown()
+}
+
+func (s *session) beginShutdown(reason shutdownReason) ([]*stream, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.state != sessionActive {
+		return nil, false
+	}
+	s.state = sessionClosing
+	s.reason = reason
 
 	streams := make([]*stream, 0, len(s.streams))
 	for st := range s.streams {
 		streams = append(streams, st)
 	}
 	s.streams = make(map[*stream]struct{})
-	return streams
+	return streams, true
+}
+
+func (s *session) finishShutdown() {
+	s.mu.Lock()
+	s.state = sessionClosed
+	s.mu.Unlock()
+}
+
+func (s *session) isActiveLocked() bool {
+	return s.state == sessionActive
 }
 
 func (s *session) stopMedia() {
@@ -488,6 +527,16 @@ func (s *session) stopMedia() {
 
 	select {
 	case <-done:
+	case <-timer.C:
+	}
+}
+
+func (s *session) waitWorkerDone() {
+	timer := time.NewTimer(workerStopTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-s.workerDone:
 	case <-timer.C:
 	}
 }
