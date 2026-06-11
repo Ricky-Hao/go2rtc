@@ -244,6 +244,64 @@ func TestSessionStartMediaDualUpgrade(t *testing.T) {
 	waitWorker(t, s)
 }
 
+func TestSessionRestartDroppedChannelReissuesDualStart(t *testing.T) {
+	client := newFakeClient()
+	manager := newSessionManager(func(string) (sessionClient, error) {
+		return client, nil
+	})
+
+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
+	require.NoError(t, err)
+	require.NoError(t, s.startMedia(0, "hd", "1"))
+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
+	require.NoError(t, err)
+	require.NoError(t, s.startMedia(1, "sd", "1"))
+
+	require.NoError(t, st0.Close())
+	s2, st0b, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
+	require.NoError(t, err)
+	require.Same(t, s, s2)
+	require.NoError(t, s.startMedia(0, "hd", "1"))
+
+	_, _, startMediaDual, startMediaChannels := client.counts()
+	_, _, startAudio := client.audioCommands()
+	require.Equal(t, []string{"0"}, startMediaChannels)
+	require.Equal(t, 2, startMediaDual)
+	require.Equal(t, 2, startAudio)
+
+	require.NoError(t, st0b.Close())
+	require.NoError(t, st1.Close())
+	waitWorker(t, s)
+}
+
+func TestSessionRestartDroppedChannelFallsBackToSingleWhenPeerGone(t *testing.T) {
+	client := newFakeClient()
+	manager := newSessionManager(func(string) (sessionClient, error) {
+		return client, nil
+	})
+
+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
+	require.NoError(t, err)
+	require.NoError(t, s.startMedia(0, "hd", "1"))
+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
+	require.NoError(t, err)
+	require.NoError(t, s.startMedia(1, "sd", "1"))
+
+	require.NoError(t, st0.Close())
+	s2, st0b, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
+	require.NoError(t, err)
+	require.Same(t, s, s2)
+	require.NoError(t, st1.Close())
+	require.NoError(t, s.startMedia(0, "hd", "1"))
+
+	_, _, startMediaDual, startMediaChannels := client.counts()
+	require.Equal(t, []string{"0", "0"}, startMediaChannels)
+	require.Equal(t, 1, startMediaDual)
+
+	require.NoError(t, st0b.Close())
+	waitWorker(t, s)
+}
+
 func TestSessionStartMediaDualKeepsSharedAudioEnabled(t *testing.T) {
 	client := newFakeClient()
 	manager := newSessionManager(func(string) (sessionClient, error) {
