@@ -35,6 +35,21 @@ type Cloud struct {
 	auth map[string]string
 }
 
+var ErrUnauthorized = errors.New("xiaomi: unauthorized")
+
+type StatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *StatusError) Error() string {
+	return e.Status
+}
+
+func (e *StatusError) Is(target error) bool {
+	return target == ErrUnauthorized && e.StatusCode == http.StatusUnauthorized
+}
+
 func NewCloud(sid string) *Cloud {
 	return &Cloud{
 		client: &http.Client{Timeout: 15 * time.Second},
@@ -435,7 +450,10 @@ func (c *Cloud) Request(baseURL, apiURL, params string, headers map[string]strin
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return nil, errors.New(res.Status)
+		return nil, &StatusError{
+			StatusCode: res.StatusCode,
+			Status:     res.Status,
+		}
 	}
 
 	body, err := io.ReadAll(res.Body)
