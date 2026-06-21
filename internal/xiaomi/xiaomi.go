@@ -53,8 +53,20 @@ func Init() {
 var log zerolog.Logger
 
 var tokens map[string]string
-var clouds map[string]*xiaomi.Cloud
+var clouds map[string]cloudClient
 var cloudsMu sync.Mutex
+
+type cloudClient interface {
+	Request(baseURL, apiURL, params string, headers map[string]string) ([]byte, error)
+}
+
+var newCloud = func(userID string) (cloudClient, error) {
+	cloud := xiaomi.NewCloud(AppXiaomiHome)
+	if err := cloud.LoginWithToken(userID, tokens[userID]); err != nil {
+		return nil, err
+	}
+	return cloud, nil
+}
 
 // missCred caches MISS authentication credentials so the second channel of a
 // dual-channel camera can skip the cloud API call. Credentials are invalidated
@@ -68,7 +80,7 @@ type missCred struct {
 	uid           string // only for TUTK
 }
 
-func getCloud(userID string) (*xiaomi.Cloud, error) {
+func getCloud(userID string) (cloudClient, error) {
 	cloudsMu.Lock()
 	defer cloudsMu.Unlock()
 
@@ -76,12 +88,12 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
 		return cloud, nil
 	}
 
-	cloud := xiaomi.NewCloud(AppXiaomiHome)
-	if err := cloud.LoginWithToken(userID, tokens[userID]); err != nil {
+	cloud, err := newCloud(userID)
+	if err != nil {
 		return nil, err
 	}
 	if clouds == nil {
-		clouds = map[string]*xiaomi.Cloud{userID: cloud}
+		clouds = map[string]cloudClient{userID: cloud}
 	} else {
 		clouds[userID] = cloud
 	}
@@ -93,7 +105,48 @@ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return cloud.Request(GetBaseURL(region), apiURL, params, nil)
+	baseURL := GetBaseURL(region)
+	res, err := cloud.Request(baseURL, apiURL, params, nil)
+	if !errors.Is(err, xiaomi.ErrUnauthorized) {
+		return res, err
+	}
+
+	cloud, refreshErr := refreshCloud(userID, cloud)
+	if refreshErr != nil {
+		return nil, fmt.Errorf("xiaomi: refresh cloud auth after %w: %w", err, refreshErr)
+	}
+	return cloud.Request(baseURL, apiURL, params, nil)
+}
+
+func refreshCloud(userID string, stale cloudClient) (cloudClient, error) {
+	cloudsMu.Lock()
+	defer cloudsMu.Unlock()
+
+	if cloud := clouds[userID]; cloud != nil && cloud != stale {
+		return cloud, nil
+	}
+
+	cloud, err := newCloud(userID)
+	if err != nil {
+		return nil, err
+	}
+	if clouds == nil {
+		clouds = map[string]cloudClient{userID: cloud}
+	} else {
+		clouds[userID] = cloud
+	}
+	return cloud, nil
+}
+
+func setUserToken(userID, token string) {
+	cloudsMu.Lock()
+	if tokens == nil {
+		tokens = map[string]string{userID: token}
+	} else {
+		tokens[userID] = token
+	}
+	delete(clouds, userID)
+	cloudsMu.Unlock()
 }
 
 func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error) {
@@ -377,13 +430,7 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
 		userID, token := auth.UserToken()
 		auth = nil
 
-		cloudsMu.Lock()
-		if tokens == nil {
-			tokens = map[string]string{userID: token}
-		} else {
-			tokens[userID] = token
-		}
-		cloudsMu.Unlock()
+		setUserToken(userID, token)
 
 		err = app.PatchConfig([]string{"xiaomi", userID}, token)
 	}
