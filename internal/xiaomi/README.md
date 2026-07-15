@@ -62,3 +62,13 @@ You can use a second channel for dual cameras: `channel=1`.
 streams:
   xiaomi1: xiaomi://***&channel=1
 ```
+
+You can keep camera audio while disabling two-way audio with
+`#backchannel=0`. Add it to every source for the same camera. The option takes
+effect after the existing MISS session reconnects and prevents go2rtc from
+starting the camera speaker.
+
+```yaml
+streams:
+  xiaomi1: xiaomi://***#backchannel=0
+```
