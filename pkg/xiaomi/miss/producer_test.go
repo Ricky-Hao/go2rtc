@@ -16,7 +16,7 @@ func TestProbeAddsDefaultSharedAudioMedia(t *testing.T) {
 	st := newTestStream(s)
 	st.ch <- testH264Packet(t)
 
-	medias, err := probe(st, true)
+	medias, err := probe(st, true, true)
 	require.NoError(t, err)
 	require.Len(t, medias, 3)
 	require.Equal(t, core.KindVideo, medias[0].Kind)
@@ -35,11 +35,45 @@ func TestProbeUsesPCMARecvDefaultForOpusTalk(t *testing.T) {
 	st := newTestStream(s)
 	st.ch <- testH264Packet(t)
 
-	medias, err := probe(st, true)
+	medias, err := probe(st, true, true)
 	require.NoError(t, err)
 	require.Len(t, medias, 3)
 	require.Equal(t, core.CodecPCMA, medias[1].Codecs[0].Name)
 	require.Equal(t, core.CodecOpus, medias[2].Codecs[0].Name)
+}
+
+func TestProbeDisablesBackchannelButKeepsReceiveAudio(t *testing.T) {
+	s := newSession(newFakeClient(), "key", nil)
+	st := newTestStream(s)
+	st.ch <- testH264Packet(t)
+
+	medias, err := probe(st, true, false)
+	require.NoError(t, err)
+	require.Len(t, medias, 2)
+	require.Equal(t, core.KindVideo, medias[0].Kind)
+	require.Equal(t, core.KindAudio, medias[1].Kind)
+	require.Equal(t, core.DirectionRecvonly, medias[1].Direction)
+}
+
+func TestParseBackchannel(t *testing.T) {
+	for _, fragment := range []string{"", "backchannel=1", "backchannel=true", "other=1"} {
+		enabled, err := parseBackchannel(fragment)
+		require.NoError(t, err)
+		require.True(t, enabled)
+	}
+
+	enabled, err := parseBackchannel("backchannel=0")
+	require.NoError(t, err)
+	require.False(t, enabled)
+
+	for _, fragment := range []string{"backchannel=0#other=1", "other=1#backchannel=0"} {
+		enabled, err = parseBackchannel(fragment)
+		require.NoError(t, err)
+		require.False(t, enabled)
+	}
+
+	_, err = parseBackchannel("backchannel=%")
+	require.Error(t, err)
 }
 
 func TestProbeDoesNotAddSharedAudioMediaWhenDisabled(t *testing.T) {
@@ -47,7 +81,7 @@ func TestProbeDoesNotAddSharedAudioMediaWhenDisabled(t *testing.T) {
 	st := newTestStream(s)
 	st.ch <- testH264Packet(t)
 
-	medias, err := probe(st, false)
+	medias, err := probe(st, false, true)
 	require.NoError(t, err)
 	require.Len(t, medias, 1)
 	require.Equal(t, core.KindVideo, medias[0].Kind)
@@ -63,7 +97,7 @@ func TestProbeReusesObservedSharedAudioCodec(t *testing.T) {
 	}
 	st0.ch <- testH264Packet(t)
 
-	medias0, err := probe(st0, true)
+	medias0, err := probe(st0, true, true)
 	require.NoError(t, err)
 	require.Len(t, medias0, 3)
 	require.Equal(t, core.CodecPCMU, medias0[1].Codecs[0].Name)
@@ -73,7 +107,7 @@ func TestProbeReusesObservedSharedAudioCodec(t *testing.T) {
 	st1 := newTestStream(s)
 	st1.ch <- testH264Packet(t)
 
-	medias1, err := probe(st1, true)
+	medias1, err := probe(st1, true, true)
 	require.NoError(t, err)
 	require.Len(t, medias1, 3)
 	require.Equal(t, core.CodecPCMU, medias1[1].Codecs[0].Name)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -29,6 +30,10 @@ func Dial(rawURL string) (core.Producer, error) {
 	if err != nil {
 		return nil, err
 	}
+	backchannel, err := parseBackchannel(u.Fragment)
+	if err != nil {
+		return nil, err
+	}
 
 	audio := parseAudioMode(query.Get("audio"))
 	sess, st, err := defaultSessionManager.acquire(rawURL, channel, audio)
@@ -42,7 +47,7 @@ func Dial(rawURL string) (core.Producer, error) {
 		return nil, err
 	}
 
-	medias, err := probe(st, audio.enabled())
+	medias, err := probe(st, audio.enabled(), backchannel)
 	if err != nil {
 		_ = st.Close()
 		return nil, err
@@ -62,6 +67,18 @@ func Dial(rawURL string) (core.Producer, error) {
 	}, nil
 }
 
+func parseBackchannel(fragment string) (bool, error) {
+	if fragment == "" {
+		return true, nil
+	}
+
+	query, err := url.ParseQuery(strings.ReplaceAll(fragment, "#", "&"))
+	if err != nil {
+		return false, fmt.Errorf("xiaomi: invalid source options: %w", err)
+	}
+	return query.Get("backchannel") != "0", nil
+}
+
 func parseChannel(query url.Values) (uint8, error) {
 	raw := query.Get("channel")
 	switch raw {
@@ -73,7 +90,7 @@ func parseChannel(query url.Values) (uint8, error) {
 	return 0, fmt.Errorf("xiaomi: unsupported channel: %s", strconv.Quote(raw))
 }
 
-func probe(st *stream, audio bool) ([]*core.Media, error) {
+func probe(st *stream, audio, backchannel bool) ([]*core.Media, error) {
 	_ = st.SetDeadline(time.Now().Add(15 * time.Second))
 
 	var vcodec, acodec *core.Codec
@@ -127,7 +144,9 @@ func probe(st *stream, audio bool) ([]*core.Media, error) {
 				acodec = st.session.defaultAudioCodec()
 			}
 		}
-		talkCodec = st.session.talkCodec()
+		if backchannel {
+			talkCodec = st.session.talkCodec()
+		}
 	}
 
 	medias := []*core.Media{
