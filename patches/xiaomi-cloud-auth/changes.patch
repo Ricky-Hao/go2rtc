@@ -193,15 +193,18 @@ index 0000000000000000000000000000000000000000..ac07adf55495afda18aaaac92942255d
 +	require.NotContains(t, clouds, "user")
 +}
 diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
-index 07f8c92e1907a1288908e12e9fe1fd49c1d4032f..5dbc9593773c69e896e1daf893833d78bffe2d9e 100644
+index 38421418c17bf56a607e9d74b3c3555e46b9ce67..00b99d4b6654abe73ca8adff490b54013ee121fd 100644
 --- a/internal/xiaomi/xiaomi.go
 +++ b/internal/xiaomi/xiaomi.go
-@@ -55,4 +55,16 @@ var log zerolog.Logger
+@@ -53,10 +53,22 @@ func Init() {
+ var log zerolog.Logger
+ 
  var tokens map[string]string
 -var clouds map[string]*xiaomi.Cloud
 +var clouds map[string]cloudClient
  var cloudsMu sync.Mutex
-+
+ 
+-func getCloud(userID string) (*xiaomi.Cloud, error) {
 +type cloudClient interface {
 +	Request(baseURL, apiURL, params string, headers map[string]string) ([]byte, error)
 +}
@@ -213,29 +216,30 @@ index 07f8c92e1907a1288908e12e9fe1fd49c1d4032f..5dbc9593773c69e896e1daf893833d78
 +	}
 +	return cloud, nil
 +}
- 
-diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
-index 5dbc9593773c69e896e1daf893833d78bffe2d9e..606a3eb9149bd6753fafb9c9255debedad638c20 100644
---- a/internal/xiaomi/xiaomi.go
-+++ b/internal/xiaomi/xiaomi.go
-@@ -82,3 +82,3 @@ type missCred struct {
- 
--func getCloud(userID string) (*xiaomi.Cloud, error) {
++
 +func getCloud(userID string) (cloudClient, error) {
  	cloudsMu.Lock()
-@@ -90,4 +90,4 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
+ 	defer cloudsMu.Unlock()
+ 
+@@ -64,12 +76,12 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
+ 		return cloud, nil
+ 	}
  
 -	cloud := xiaomi.NewCloud(AppXiaomiHome)
 -	if err := cloud.LoginWithToken(userID, tokens[userID]); err != nil {
 +	cloud, err := newCloud(userID)
 +	if err != nil {
  		return nil, err
-@@ -95,3 +95,3 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
+ 	}
  	if clouds == nil {
 -		clouds = map[string]*xiaomi.Cloud{userID: cloud}
 +		clouds = map[string]cloudClient{userID: cloud}
  	} else {
-@@ -107,3 +107,44 @@ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
+ 		clouds[userID] = cloud
+ 	}
+@@ -81,7 +93,48 @@ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
+ 	if err != nil {
+ 		return nil, err
  	}
 -	return cloud.Request(GetBaseURL(region), apiURL, params, nil)
 +	baseURL := GetBaseURL(region)
@@ -281,7 +285,11 @@ index 5dbc9593773c69e896e1daf893833d78bffe2d9e..606a3eb9149bd6753fafb9c9255debed
 +	delete(clouds, userID)
 +	cloudsMu.Unlock()
  }
-@@ -391,9 +432,3 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
+ 
+ func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error) {
+@@ -365,13 +418,7 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
+ 		userID, token := auth.UserToken()
+ 		auth = nil
  
 -		cloudsMu.Lock()
 -		if tokens == nil {
@@ -292,6 +300,8 @@ index 5dbc9593773c69e896e1daf893833d78bffe2d9e..606a3eb9149bd6753fafb9c9255debed
 -		cloudsMu.Unlock()
 +		setUserToken(userID, token)
  
+ 		err = app.PatchConfig([]string{"xiaomi", userID}, token)
+ 	}
 diff --git a/pkg/xiaomi/cloud.go b/pkg/xiaomi/cloud.go
 index 0dcfd241417a9a756e282f555acd842bbe17f75f..f5e61ed735dc879031b07b1b5dca1db01241667f 100644
 --- a/pkg/xiaomi/cloud.go

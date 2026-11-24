@@ -1,22 +1,24 @@
 {
   "format": 1,
-  "base": "dc1685e9cf7a8c349181f20a1b4a44825ed394c5",
+  "base": "85495f41d961ad166c5631de32df664b46bb8588",
   "patches": [
     {
       "id": "cs2-media-buffer",
-      "status": "keep",
+      "status": "upstream",
       "depends_on": [],
-      "patch": "patches/cs2-media-buffer/changes.patch",
-      "paths": [
-        "pkg/xiaomi/miss/cs2/conn.go"
-      ],
+      "patch": null,
+      "paths": [],
+      "replacement": {
+        "commit": "6fe6e24b92d5a2bdf7345891792471f20382e08e",
+        "evidence": "The CS2 overflow contract feeds the upstream worker through net.Pipe. The full control (10) and media (100) queues retain earlier packets, drop the new arrival, and accept later packets after draining while the connection remains responsive."
+      },
       "tests": "patches/cs2-media-buffer/tests.json"
     },
     {
-      "id": "miss-shared-session",
+      "id": "xiaomi-miss",
       "status": "feature",
       "depends_on": [],
-      "patch": "patches/miss-shared-session/changes.patch",
+      "patch": "patches/xiaomi-miss/changes.patch",
       "paths": [
         "internal/xiaomi/MISS_REFACTOR_IMPLEMENTATION_PLAN.md",
         "internal/xiaomi/README.md",
@@ -33,20 +35,7 @@
         "pkg/xiaomi/miss/session_manager.go",
         "pkg/xiaomi/miss/session_manager_test.go"
       ],
-      "tests": "patches/miss-shared-session/tests.json"
-    },
-    {
-      "id": "miss-channel-reconnect",
-      "status": "keep",
-      "depends_on": [
-        "miss-shared-session"
-      ],
-      "patch": "patches/miss-channel-reconnect/changes.patch",
-      "paths": [
-        "pkg/xiaomi/miss/session.go",
-        "pkg/xiaomi/miss/session_manager_test.go"
-      ],
-      "tests": "patches/miss-channel-reconnect/tests.json"
+      "tests": "patches/xiaomi-miss/tests.json"
     },
     {
       "id": "xiaomi-cloud-auth",
@@ -59,40 +48,6 @@
         "pkg/xiaomi/cloud.go"
       ],
       "tests": "patches/xiaomi-cloud-auth/tests.json"
-    },
-    {
-      "id": "miss-receive-only",
-      "status": "feature",
-      "depends_on": [
-        "miss-shared-session"
-      ],
-      "patch": "patches/miss-receive-only/changes.patch",
-      "paths": [
-        "internal/xiaomi/README.md",
-        "pkg/xiaomi/miss/producer.go",
-        "pkg/xiaomi/miss/producer_test.go"
-      ],
-      "tests": "patches/miss-receive-only/tests.json"
-    },
-    {
-      "id": "legacy-workflow",
-      "status": "local",
-      "depends_on": [],
-      "patch": "patches/legacy-workflow/changes.patch",
-      "paths": [
-        ".github/workflows/build.yml"
-      ],
-      "tests": "patches/legacy-workflow/tests.json"
-    },
-    {
-      "id": "contributor-guidance",
-      "status": "local",
-      "depends_on": [],
-      "patch": "patches/contributor-guidance/changes.patch",
-      "paths": [
-        "AGENTS.md"
-      ],
-      "tests": "patches/contributor-guidance/tests.json"
     }
   ]
 }

@@ -65,6 +65,36 @@
       ]
     },
     {
+      "name": "Restart a dropped MISS channel with or without a peer",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        "go.mod",
+        "pkg/xiaomi/miss/session_manager_test.go"
+      ],
+      "runner": "go",
+      "package": "./pkg/xiaomi/miss",
+      "tests": [
+        "TestSessionRestartDroppedChannelReissuesDualStart",
+        "TestSessionRestartDroppedChannelFallsBackToSingleWhenPeerGone"
+      ]
+    },
+    {
+      "name": "MISS receive-only audio and backchannel parsing",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        "go.mod",
+        "pkg/xiaomi/miss/producer_test.go"
+      ],
+      "runner": "go",
+      "package": "./pkg/xiaomi/miss",
+      "tests": [
+        "TestProbeDisablesBackchannelButKeepsReceiveAudio",
+        "TestParseBackchannel"
+      ]
+    },
+    {
       "name": "Local media and streaming package tests",
       "tier": "project",
       "cwd": ".",

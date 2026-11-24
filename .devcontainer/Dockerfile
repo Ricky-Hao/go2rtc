@@ -1,4 +1,4 @@
-FROM docker.io/library/golang:1.25.14-bookworm
+FROM docker.io/library/golang:1.27.4-bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

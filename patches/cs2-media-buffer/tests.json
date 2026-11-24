@@ -15,6 +15,58 @@
         "-mod=readonly",
         "./pkg/xiaomi/miss/cs2"
       ]
+    },
+    {
+      "name": "CS2 worker survives control and media queue overflow",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        "go.mod",
+        "pkg/xiaomi/miss/cs2/conn.go",
+        "pkg/xiaomi/miss/cs2/conn_test.go"
+      ],
+      "runner": "command",
+      "command": [
+        "python3",
+        "-c",
+        "import json, subprocess, sys\nfrom pathlib import Path\nfrom tempfile import TemporaryDirectory\n\npackage = './pkg/xiaomi/miss/cs2'\nwith TemporaryDirectory() as directory:\n    test = Path(directory) / 'patchset_queue_overflow_test.go'\n    test.write_text('\\n'.join(sys.argv[1:]) + '\\n', encoding='utf-8')\n    overlay = test.with_suffix('.json')\n    virtual = Path(package).resolve() / test.name\n    overlay.write_text(json.dumps({'Replace': {str(virtual): str(test)}}), encoding='utf-8')\n    result = subprocess.run(['go', 'test', '-mod=readonly', '-count=1', '-timeout=15s', '-v', '-run', '^TestPatchsetQueueOverflow$', '-overlay', str(overlay), package], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n    print(result.stdout, end='')\n    result.check_returncode()\n    if not any(line.startswith('--- PASS: TestPatchsetQueueOverflow ') for line in result.stdout.splitlines()):\n        sys.exit('The CS2 overflow test did not run and pass')",
+        "package cs2",
+        "\nimport (",
+        "\t\"encoding/binary\"",
+        "\t\"testing\"",
+        "\n\t\"github.com/stretchr/testify/require\"",
+        ")",
+        "\nfunc TestPatchsetQueueOverflow(t *testing.T) {",
+        "\tc, peer := newTestConn(t, false)",
+        "\tfor _, queue := range []struct {",
+        "\t\tchannel  byte",
+        "\t\tcapacity int",
+        "\t}{{0, 10}, {2, 100}} {",
+        "\t\tsend := func(seq int) {",
+        "\t\t\tvar body [8]byte",
+        "\t\t\tbinary.BigEndian.PutUint32(body[:4], 4)",
+        "\t\t\tbinary.BigEndian.PutUint32(body[4:], uint32(seq))",
+        "\t\t\twriteConn(t, peer, drwFrame(queue.channel, uint16(seq), body[:]))",
+        "\t\t\tack := readConn(t, peer, 10)",
+        "\t\t\trequire.Equal(t, byte(msgDrwAck), ack[1])",
+        "\t\t\trequire.Equal(t, queue.channel, ack[5])",
+        "\t\t}",
+        "\n\t\tfor seq := 0; seq <= queue.capacity; seq++ {",
+        "\t\t\tsend(seq)",
+        "\t\t}",
+        "\t\tbuffered := c.channels[queue.channel].popBuf",
+        "\t\trequire.Len(t, buffered, queue.capacity)",
+        "\t\tfor want := range queue.capacity {",
+        "\t\t\trequire.Equal(t, uint32(want), binary.BigEndian.Uint32(<-buffered))",
+        "\t\t}",
+        "\n\t\tsend(queue.capacity + 1)",
+        "\t\trequire.Len(t, buffered, 1)",
+        "\t\trequire.Equal(t, uint32(queue.capacity+1), binary.BigEndian.Uint32(<-buffered))",
+        "\t}",
+        "\twriteConn(t, peer, []byte{magic, msgPing, 0, 0})",
+        "\trequire.Equal(t, []byte{magic, msgPong, 0, 0}, readConn(t, peer, 4))",
+        "}"
+      ]
     }
   ]
 }
