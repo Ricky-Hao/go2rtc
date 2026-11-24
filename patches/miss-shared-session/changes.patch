@@ -1,0 +1,3325 @@
+diff --git a/internal/xiaomi/MISS_REFACTOR_IMPLEMENTATION_PLAN.md b/internal/xiaomi/MISS_REFACTOR_IMPLEMENTATION_PLAN.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..97807acb2267d28c7f53082ce93fc616b096ba49
+--- /dev/null
++++ b/internal/xiaomi/MISS_REFACTOR_IMPLEMENTATION_PLAN.md
+@@ -0,0 +1,554 @@
++# Xiaomi MISS refactor implementation plan
++
++This branch is for implementing a behavior-preserving refactor of the Xiaomi
++MISS path. The plan below is the merged result after independent reviews from
++GPT-5.5, Opus 4.6, and Opus 4.7, followed by cross-review between the three
++approaches.
++
++## Current baseline
++
++Branch: `refactor/xiaomi-miss-lifecycle`
++
++Baseline commit:
++
++```text
++df75537 xiaomi: harden MISS session cleanup
++```
++
++Relevant files:
++
++- `internal/xiaomi/xiaomi.go`
++  - Xiaomi cloud URL construction
++  - MISS credential cache and TTL
++- `pkg/xiaomi/miss/producer.go`
++  - Producer `Dial`
++  - session open/start/probe flow
++- `pkg/xiaomi/miss/session.go`
++  - shared session map
++  - session lifecycle
++  - stream registration/removal
++  - worker read loop
++  - packet dispatch
++  - dual-channel classifier state
++  - shutdown and best-effort `StopMedia`
++
++## Refactor goals
++
++1. Preserve current user-facing behavior and URL format.
++2. Make shared MISS session reuse safe by construction.
++3. Make reconnect behavior auditable and testable.
++4. Move dual-channel packet classification into an isolated component.
++5. Add focused tests around the logic that caused recent regressions.
++6. Avoid broad CS2/TUTK transport rewrites.
++
++## Non-goals
++
++- Do not change Xiaomi cloud API behavior.
++- Do not change stream configuration syntax.
++- Do not rewrite CS2/TUTK transport implementations.
++- Do not change classifier strategy order unless new device traces justify it.
++- Do not make the MISS credential TTL configurable in the first pass.
++- Do not fix `startMedia` holding `session.mu` across network I/O in this
++  refactor; document the hazard and keep the manager lock away from this path.
++
++## Cross-review decisions
++
++### Use a small `sessionClient` interface plus a client factory
++
++The existing `Conn` interface is transport-level and does not expose the
++higher-level methods used by sessions, such as `StartMedia`, `StartMediaDual`,
++`StopMedia`, `ReadPacket() (*Packet, error)`, and `IsDafangLike`.
++
++Use a package-private `sessionClient` interface and inject client construction
++through the session manager:
++
++```go
++type clientFactory func(rawURL string) (sessionClient, error)
++```
++
++`*Client` must satisfy `sessionClient` without changing production behavior.
++
++### Use lifecycle-safe acquire and stream registration
++
++A plain `getOrCreate(rawURL) (*session, error)` is too weak because a returned
++session can transition to closing before `Dial` calls `openStream`.
++
++The manager should own a lifecycle-safe acquire operation:
++
++```go
++func (m *sessionManager) acquire(rawURL string, channel uint8) (*session, *stream, error)
++```
++
++This operation checks session state and registers the stream under the same
++lifecycle boundary. Callers should not receive a session that cannot accept the
++stream.
++
++### Use one explicit session state machine
++
++Do not keep `closeOnce` as a second source of truth beside a state field.
++
++Use a package-private state machine guarded by `session.mu`:
++
++```go
++type sessionState uint8
++
++const (
++    sessionActive sessionState = iota
++    sessionClosing
++    sessionClosed
++)
++```
++
++The first shutdown caller transitions `active -> closing`, captures the
++shutdown reason, and owns cleanup. Later shutdown callers return without doing
++cleanup.
++
++### Keep classifier synchronization owned by `session`
++
++`packetClassifier` should be a plain package-private struct with no internal
++mutex. It is called only under `session.mu`. This preserves the current
++synchronization model and avoids a second lock.
++
++### Extract low-risk pure components before lifecycle work
++
++The credential cache and classifier extractions are independent of session
++lifecycle. Do them first to reduce the size and risk of the later manager
++change.
++
++Final phase order:
++
++1. capture baseline
++2. extract credential cache
++3. extract packet classifier
++4. add lifecycle test seam
++5. introduce session manager and explicit lifecycle
++6. cleanup and validation
++
++### Preserve current integration surfaces
++
++The refactor should keep the existing `Producer.Stop -> core.Connection.Stop ->
++stream.Close -> session.removeStream` ownership chain. Do not move `StopMedia`
++directly into `Producer.Stop`; MISS sessions can be shared by multiple streams,
++so the session should continue to decide when the last stream has gone away.
++
++The existing backchannel path calls session methods through
++`p.stream.session.startSpeaker`, `writeAudio`, and `speakerCodec`. Keep those
++session-level methods available, and make the test client seam cover them
++instead of adding a separate producer/backchannel abstraction in this refactor.
++
++The valid Xiaomi channel values are `channel=0` and `channel=1`. The current
++README text that mentions `channel=2` is wrong and should be fixed as part of
++the refactor cleanup, not preserved as compatibility behavior.
++
++## Key invariants
++
++### Lock ordering
++
++- Never dial or perform network I/O while holding `sessionManager.mu`.
++- If both locks are needed, acquire `sessionManager.mu` before `session.mu`.
++- Do not call `StartMedia`, `StartMediaDual`, `StopMedia`, `Close`, or
++  `ReadPacket` while holding `sessionManager.mu`.
++- `startMedia` may continue to hold `session.mu` across network I/O for now,
++  but this must not be combined with manager locking.
++
++### Shutdown policy
++
++Use an explicit shutdown reason:
++
++```go
++type shutdownReason uint8
++
++const (
++    shutdownReadError shutdownReason = iota
++    shutdownNoStreams
++)
++```
++
++Rules:
++
++- `shutdownReadError`: remove from manager, close streams, close client; skip
++  `StopMedia`.
++- `shutdownNoStreams`: remove from manager, close streams, attempt bounded
++  best-effort `StopMedia`, then close client.
++- The first shutdown reason wins.
++- `StopMedia` must not silently race an immediate `Close`; tests must verify
++  ordering in the normal no-stream shutdown path.
++
++### Dialing and duplicate creation
++
++The manager must not hold its mutex while dialing. Use double-check behavior:
++
++1. lock manager
++2. find an active reusable session if present
++3. unlock
++4. dial new client outside locks if needed
++5. lock manager again
++6. if another active session appeared, close the newly dialed client and use
++   the existing session
++7. otherwise install the new session
++
++The lifecycle-safe acquire step must then register the stream only if the
++session is still active.
++
++## Phase 0: Capture baseline
++
++Run targeted tests before changing code:
++
++```bash
++go test ./internal/xiaomi ./pkg/xiaomi/miss ./pkg/xiaomi/miss/cs2 ./pkg/tutk
++```
++
++Also run full suite once and record unrelated baseline failures:
++
++```bash
++go test ./...
++```
++
++The full suite currently has unrelated failures outside Xiaomi; capture the
++list before this refactor so later results can distinguish pre-existing issues
++from regressions.
++
++## Phase 1: Extract MISS credential cache
++
++### Code changes
++
++Move cache logic out of `xiaomi.go` into `internal/xiaomi/miss_cred_cache.go`.
++
++Use a typed key:
++
++```go
++type missCredKey struct {
++    UserID string
++    Region string
++    DID    string
++}
++```
++
++Use a small cache with injectable clock:
++
++```go
++type missCredCache struct {
++    mu    sync.Mutex
++    ttl   time.Duration
++    now   func() time.Time
++    items map[missCredKey]missCredEntry
++}
++
++type missCredEntry struct {
++    cred      missCred
++    expiresAt time.Time
++}
++```
++
++Keep the current 30-second TTL. Store `expiresAt` in the cache entry, not in
++`missCred`, so credential payloads cannot be accidentally reused with stale
++expiration metadata.
++
++Expected production global:
++
++```go
++var missCreds = newMissCredCache(missCredTTL, time.Now)
++```
++
++### Tests
++
++Add `internal/xiaomi/miss_cred_cache_test.go`.
++
++Required cases:
++
++1. fresh credentials are returned
++2. expired credentials miss and are deleted
++3. keys differ by user ID, region, and DID
++4. injectable clock controls expiration
++5. legacy fallback results are not cached
++6. cache hit restores all MISS URL query params:
++   - `client_public`
++   - `client_private`
++   - `device_public`
++   - `sign`
++   - `vendor`
++   - optional `uid`
++
++### Acceptance
++
++```bash
++go test ./internal/xiaomi
++```
++
++## Phase 2: Extract packet classifier
++
++### Code changes
++
++Move classifier state and helper methods from `session` into
++`pkg/xiaomi/miss/classifier.go`.
++
++```go
++type packetClassifier struct {
++    hdrChanSeen   [2]bool
++    flagsChanSeen [2]bool
++    resolutions   map[uint32]uint8
++    lastTS        [2]uint64
++    tsInit        [2]bool
++}
++
++func newPacketClassifier() *packetClassifier
++func (c *packetClassifier) Classify(pkt *Packet) uint8
++```
++
++`Classify` must include the current post-classify timestamp update:
++
++```go
++ch := c.classify(pkt)
++c.lastTS[ch] = pkt.Timestamp
++c.tsInit[ch] = true
++return ch
++```
++
++Preserve the current strategy order exactly:
++
++1. `hdr[28]` channel field after both channels have been observed
++2. `(flags >> 24) & 0x01` after both channels have been observed
++3. SPS resolution mapping
++4. timestamp continuity
++5. default channel `0`
++
++`session.dispatch` remains responsible for:
++
++- broadcasting audio
++- sending all video to a single active stream
++- calling the classifier only when multiple video streams are active
++- routing the classified packet
++
++### Tests
++
++Add `pkg/xiaomi/miss/classifier_test.go`.
++
++Required cases:
++
++1. header channel is not trusted until both channels are observed
++2. flags channel is not trusted until both channels are observed
++3. highest resolution maps to channel 0
++4. with 3+ resolutions, max maps to 0 and all others map to 1
++5. timestamp tie-break uses channel 0
++6. backwards timestamp is treated as far away
++7. single-stream dispatch path does not call classifier
++
++### Acceptance
++
++```bash
++go test ./pkg/xiaomi/miss
++```
++
++## Phase 3: Add lifecycle test seam
++
++### Code changes
++
++Introduce a package-private interface containing the methods used by `session`:
++
++```go
++type sessionClient interface {
++    Protocol() string
++    Version() string
++    IsDafangLike() bool
++    StartMedia(channel, quality, audio string) error
++    StartMediaDual(quality0, quality1, audio string) error
++    StopMedia() error
++    StartSpeaker() error
++    SpeakerCodec() uint32
++    WriteAudio(codecID uint32, payload []byte) error
++    ReadPacket() (*Packet, error)
++    RemoteAddr() net.Addr
++    SetDeadline(time.Time) error
++    Close() error
++}
++```
++
++Change session to hold:
++
++```go
++client sessionClient
++```
++
++Add a client factory to the future manager shape:
++
++```go
++type clientFactory func(rawURL string) (sessionClient, error)
++```
++
++Production factory wraps `NewClient`.
++
++### Tests
++
++Add a fake client in `pkg/xiaomi/miss` tests. It must support:
++
++- controllable `IsDafangLike`
++- programmable `ReadPacket` error for worker shutdown
++- counters for `StartMedia`, `StartMediaDual`, `StopMedia`, and `Close`
++- blocking `StopMedia` to test close ordering
++- fake remote address
++
++Required characterization tests:
++
++1. active shared session is reused for second stream
++2. dafang-like session is not stored/reused
++3. read-error shutdown skips `StopMedia`
++4. no-stream shutdown attempts bounded `StopMedia`
++5. single-channel to dual-channel upgrade calls `StartMediaDual`
++6. `StartMediaDual` failure does not mark the second channel started
++7. `channel=0` selects internal channel `0`, and `channel=1` selects internal
++   channel `1`
++
++### Acceptance
++
++```bash
++go test ./pkg/xiaomi/miss
++```
++
++## Phase 4: Introduce session manager and explicit lifecycle
++
++### Code changes
++
++Add `pkg/xiaomi/miss/session_manager.go`:
++
++```go
++type sessionManager struct {
++    mu        sync.Mutex
++    sessions map[string]*session
++    newClient clientFactory
++}
++```
++
++Use a package-level default:
++
++```go
++var defaultSessionManager = newSessionManager(defaultClientFactory)
++```
++
++Replace global `sessionMu` / `sessions` with manager-owned state.
++
++The manager API should be lifecycle-safe:
++
++```go
++func (m *sessionManager) acquire(rawURL string, channel uint8) (*session, *stream, error)
++func (m *sessionManager) remove(s *session)
++```
++
++Acquire rules:
++
++1. parse session key
++2. check for active reusable session under manager lock
++3. do not dial under manager lock
++4. do not store dafang-like sessions
++5. if duplicate dialing races, close the losing client
++6. register the stream only if the session is still active
++7. do not return closing or closed sessions
++
++Session state:
++
++```go
++type sessionState uint8
++
++const (
++    sessionActive sessionState = iota
++    sessionClosing
++    sessionClosed
++)
++```
++
++Shutdown rules:
++
++1. lock `session.mu`
++2. if state is not active, return
++3. set state to closing and capture shutdown reason
++4. drain streams
++5. unlock `session.mu`
++6. remove from manager map
++7. close drained streams
++8. if reason is `shutdownNoStreams`, run bounded best-effort `StopMedia`
++9. close client
++10. mark state closed
++
++Add `workerDone chan struct{}` so tests can deterministically assert worker
++exit. Worker should close it before returning.
++
++### StopMedia ordering
++
++The normal no-stream path should not call `Close` before `StopMedia` returns or
++the bounded timeout path intentionally proceeds. Tests should cover both fast
++and blocked `StopMedia`.
++
++If `StopMedia` times out, closing the client to unblock transport I/O is
++acceptable, but the behavior must be explicit and tested with fake clients.
++
++### Tests
++
++Required lifecycle tests:
++
++1. active shared session is reused
++2. dafang-like session is not shared
++3. closing/closed session is not reused
++4. concurrent acquire during shutdown gets a new session or a clear retryable
++   error handled inside `Dial`
++5. concurrent acquire for the same key closes the losing client
++6. read-error shutdown skips `StopMedia`
++7. last-stream shutdown attempts bounded `StopMedia`
++8. `Close` does not happen before `StopMedia` returns on the fast path
++9. racing shutdown callers run cleanup once
++10. first shutdown reason wins
++11. redial after read-error creates a fresh session
++12. worker exits before shutdown returns
++13. shared-session shutdown still happens through `stream.Close`, preserving
++    the current `Producer.Stop -> core.Connection.Stop` ownership path
++
++### Acceptance
++
++```bash
++go test ./pkg/xiaomi/miss
++go test -race ./pkg/xiaomi/miss
++```
++
++## Phase 5: Cleanup and validation
++
++### Cleanup
++
++- Remove obsolete global session map helpers.
++- Remove classifier fields from `session`.
++- Remove credential cache map/mutex free functions from `xiaomi.go`.
++- Keep new types package-private.
++- Add a short comment/TODO noting that `startMedia` still holds `session.mu`
++  during network I/O and should be addressed separately if it becomes a real
++  bottleneck.
++
++### Validation
++
++Targeted gate:
++
++```bash
++gofmt -w internal/xiaomi/*.go pkg/xiaomi/miss/*.go
++go test ./internal/xiaomi ./pkg/xiaomi/miss ./pkg/xiaomi/miss/cs2 ./pkg/tutk
++go test -race ./pkg/xiaomi/miss
++git diff --check
++```
++
++Full-suite signal:
++
++```bash
++go test ./...
++```
++
++The targeted Xiaomi/MISS checks are the required gate for this branch because
++the full suite currently has unrelated baseline failures outside Xiaomi.
++
++## Commit plan
++
++Use one reviewable commit per phase:
++
++1. `xiaomi: extract MISS credential cache`
++2. `xiaomi: extract MISS packet classifier`
++3. `xiaomi: add MISS session test seam`
++4. `xiaomi: refactor MISS session lifecycle`
++5. `xiaomi: clean up MISS refactor`
++
++The riskiest checkpoint is the session manager/lifecycle commit. It should be
++reviewed before follow-up behavior changes such as moving `startMedia` network
++I/O out of `session.mu`.
+diff --git a/internal/xiaomi/README.md b/internal/xiaomi/README.md
+index 330183e8c0af197a9ae0b4519c20effa64116c34..334d9d15088b0eaf92ca2a17179d94e442b0a930 100644
+--- a/internal/xiaomi/README.md
++++ b/internal/xiaomi/README.md
+@@ -56,9 +56,9 @@ streams:
+   xiaomi1: xiaomi://***&subtype=sd
+ ```
+ 
+-You can use a second channel for dual cameras: `channel=2`.
++You can use a second channel for dual cameras: `channel=1`.
+ 
+ ```yaml
+ streams:
+-  xiaomi1: xiaomi://***&channel=2
++  xiaomi1: xiaomi://***&channel=1
+ ```
+diff --git a/internal/xiaomi/miss_cred_cache.go b/internal/xiaomi/miss_cred_cache.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..90eed22f4385686d2f2b31eb2d3ebd38ad88527f
+--- /dev/null
++++ b/internal/xiaomi/miss_cred_cache.go
+@@ -0,0 +1,67 @@
++package xiaomi
++
++import (
++	"sync"
++	"time"
++)
++
++// Keep MISS credentials short-lived: they are only meant to bridge the
++// near-simultaneous startup of dual-channel streams, not later reconnects.
++const missCredTTL = 30 * time.Second
++
++var missCreds = newMissCredCache(missCredTTL, time.Now)
++
++type missCredKey struct {
++	userID string
++	region string
++	did    string
++}
++
++type missCredEntry struct {
++	cred      missCred
++	expiresAt time.Time
++}
++
++type missCredCache struct {
++	mu    sync.Mutex
++	ttl   time.Duration
++	now   func() time.Time
++	items map[missCredKey]missCredEntry
++}
++
++func newMissCredCache(ttl time.Duration, now func() time.Time) *missCredCache {
++	if now == nil {
++		now = time.Now
++	}
++	return &missCredCache{
++		ttl:   ttl,
++		now:   now,
++		items: make(map[missCredKey]missCredEntry),
++	}
++}
++
++func (c *missCredCache) Get(key missCredKey) (missCred, bool) {
++	now := c.now()
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	entry, ok := c.items[key]
++	if !ok {
++		return missCred{}, false
++	}
++	if !now.Before(entry.expiresAt) {
++		delete(c.items, key)
++		return missCred{}, false
++	}
++	return entry.cred, true
++}
++
++func (c *missCredCache) Set(key missCredKey, cred missCred) {
++	c.mu.Lock()
++	c.items[key] = missCredEntry{
++		cred:      cred,
++		expiresAt: c.now().Add(c.ttl),
++	}
++	c.mu.Unlock()
++}
+diff --git a/internal/xiaomi/miss_cred_cache_test.go b/internal/xiaomi/miss_cred_cache_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..456bbb0cb64529ccc89f588a799c6f29ece5b89a
+--- /dev/null
++++ b/internal/xiaomi/miss_cred_cache_test.go
+@@ -0,0 +1,101 @@
++package xiaomi
++
++import (
++	"net/url"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestMissCredCache(t *testing.T) {
++	now := time.Unix(1000, 0)
++	cache := newMissCredCache(time.Minute, func() time.Time { return now })
++	key := missCredKey{userID: "user", region: "cn", did: "did1"}
++	cred := missCred{clientPublic: "cpub", vendor: "cs2"}
++
++	cache.Set(key, cred)
++
++	got, ok := cache.Get(key)
++	require.True(t, ok)
++	require.Equal(t, cred, got)
++
++	now = now.Add(time.Minute)
++	got, ok = cache.Get(key)
++	require.False(t, ok)
++	require.Empty(t, got)
++	require.Empty(t, cache.items)
++}
++
++func TestMissCredCacheKeySeparatesCredentials(t *testing.T) {
++	cache := newMissCredCache(time.Minute, nil)
++	key := missCredKey{userID: "user", region: "cn", did: "did1"}
++	cred := missCred{clientPublic: "cpub"}
++
++	cache.Set(key, cred)
++
++	for _, other := range []missCredKey{
++		{userID: "other", region: "cn", did: "did1"},
++		{userID: "user", region: "de", did: "did1"},
++		{userID: "user", region: "cn", did: "did2"},
++	} {
++		_, ok := cache.Get(other)
++		require.False(t, ok)
++	}
++}
++
++func TestGetMissURLUsesCachedCredentials(t *testing.T) {
++	old := missCreds
++	t.Cleanup(func() { missCreds = old })
++
++	now := time.Unix(1000, 0)
++	missCreds = newMissCredCache(time.Minute, func() time.Time { return now })
++	missCreds.Set(missCredKey{userID: "user", region: "cn", did: "did1"}, missCred{
++		clientPublic:  "cpub",
++		clientPrivate: "cpriv",
++		devicePublic:  "dpub",
++		sign:          "sign",
++		vendor:        "tutk",
++		uid:           "uid",
++	})
++
++	u, err := url.Parse("xiaomi://user:cn@192.168.1.2?did=did1&model=test")
++	require.NoError(t, err)
++
++	rawURL, err := getMissURL(u)
++	require.NoError(t, err)
++
++	got, err := url.Parse(rawURL)
++	require.NoError(t, err)
++	query := got.Query()
++	require.Equal(t, "cpub", query.Get("client_public"))
++	require.Equal(t, "cpriv", query.Get("client_private"))
++	require.Equal(t, "dpub", query.Get("device_public"))
++	require.Equal(t, "sign", query.Get("sign"))
++	require.Equal(t, "tutk", query.Get("vendor"))
++	require.Equal(t, "uid", query.Get("uid"))
++}
++
++func TestGetMissURLDoesNotSetEmptyCachedUID(t *testing.T) {
++	old := missCreds
++	t.Cleanup(func() { missCreds = old })
++
++	missCreds = newMissCredCache(time.Minute, nil)
++	missCreds.Set(missCredKey{userID: "user", region: "cn", did: "did1"}, missCred{
++		clientPublic:  "cpub",
++		clientPrivate: "cpriv",
++		devicePublic:  "dpub",
++		sign:          "sign",
++		vendor:        "cs2",
++	})
++
++	u, err := url.Parse("xiaomi://user:cn@192.168.1.2?did=did1&uid=old")
++	require.NoError(t, err)
++
++	rawURL, err := getMissURL(u)
++	require.NoError(t, err)
++
++	got, err := url.Parse(rawURL)
++	require.NoError(t, err)
++	require.Equal(t, "old", got.Query().Get("uid"))
++}
+diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
+index 1e578420c1076d954427da90dfbe779b4e5f6f03..07f8c92e1907a1288908e12e9fe1fd49c1d4032f 100644
+--- a/internal/xiaomi/xiaomi.go
++++ b/internal/xiaomi/xiaomi.go
+@@ -56,6 +56,18 @@ var tokens map[string]string
+ var clouds map[string]*xiaomi.Cloud
+ var cloudsMu sync.Mutex
+ 
++// missCred caches MISS authentication credentials so the second channel of a
++// dual-channel camera can skip the cloud API call. Credentials are invalidated
++// after missCredTTL to ensure stale credentials don't prevent reconnection.
++type missCred struct {
++	clientPublic  string
++	clientPrivate string
++	devicePublic  string
++	sign          string
++	vendor        string
++	uid           string // only for TUTK
++}
++
+ func getCloud(userID string) (*xiaomi.Cloud, error) {
+ 	cloudsMu.Lock()
+ 	defer cloudsMu.Unlock()
+@@ -150,12 +162,34 @@ func getLegacyURL(url *url.URL) (string, error) {
+ }
+ 
+ func getMissURL(url *url.URL) (string, error) {
++	query := url.Query()
++	region, _ := url.User.Password()
++
++	// Check credential cache first. The second channel of a dual-channel
++	// camera can reuse the same credentials without a cloud API call.
++	cacheKey := missCredKey{
++		userID: url.User.Username(),
++		region: region,
++		did:    query.Get("did"),
++	}
++	if cred, ok := missCreds.Get(cacheKey); ok {
++		query.Set("client_public", cred.clientPublic)
++		query.Set("client_private", cred.clientPrivate)
++		query.Set("device_public", cred.devicePublic)
++		query.Set("sign", cred.sign)
++		query.Set("vendor", cred.vendor)
++		if cred.uid != "" {
++			query.Set("uid", cred.uid)
++		}
++		url.RawQuery = query.Encode()
++		return url.String(), nil
++	}
++
+ 	clientPublic, clientPrivate, err := crypto.GenerateKey()
+ 	if err != nil {
+ 		return "", err
+ 	}
+ 
+-	query := url.Query()
+ 	params := fmt.Sprintf(
+ 		`{"app_pubkey":"%x","did":"%s","support_vendors":"TUTK_CS2_MTP"}`,
+ 		clientPublic, query.Get("did"),
+@@ -183,16 +217,32 @@ func getMissURL(url *url.URL) (string, error) {
+ 		return "", err
+ 	}
+ 
+-	query.Set("client_public", hex.EncodeToString(clientPublic))
+-	query.Set("client_private", hex.EncodeToString(clientPrivate))
++	cpub := hex.EncodeToString(clientPublic)
++	cpriv := hex.EncodeToString(clientPrivate)
++	vendor := getVendorName(v.Vendor.ID)
++
++	query.Set("client_public", cpub)
++	query.Set("client_private", cpriv)
+ 	query.Set("device_public", v.PublicKey)
+ 	query.Set("sign", v.Sign)
+-	query.Set("vendor", getVendorName(v.Vendor.ID))
++	query.Set("vendor", vendor)
+ 
++	var uid string
+ 	if v.Vendor.ID == 1 {
+-		query.Set("uid", v.Vendor.Params.UID)
++		uid = v.Vendor.Params.UID
++		query.Set("uid", uid)
+ 	}
+ 
++	// Cache the credentials for dual-channel reuse.
++	missCreds.Set(cacheKey, missCred{
++		clientPublic:  cpub,
++		clientPrivate: cpriv,
++		devicePublic:  v.PublicKey,
++		sign:          v.Sign,
++		vendor:        vendor,
++		uid:           uid,
++	})
++
+ 	url.RawQuery = query.Encode()
+ 	return url.String(), nil
+ }
+diff --git a/pkg/xiaomi/miss/backchannel.go b/pkg/xiaomi/miss/backchannel.go
+index 02ea3bb1d01107f894f2b3f1f7582ad523e46442..c0514f29d0029b9ee8dc82bea4be4185dfe321f3 100644
+--- a/pkg/xiaomi/miss/backchannel.go
++++ b/pkg/xiaomi/miss/backchannel.go
+@@ -1,6 +1,7 @@
+ package miss
+ 
+ import (
++	"fmt"
+ 	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
+@@ -9,29 +10,34 @@ import (
+ 	"github.com/pion/rtp"
+ )
+ 
+-func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiver) error {
+-	if err := p.client.StartSpeaker(); err != nil {
++func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
++	if err := p.stream.session.startSpeaker(); err != nil {
+ 		return err
+ 	}
+ 	// TODO: check this!!!
+ 	time.Sleep(time.Second)
+ 
+-	sender := core.NewSender(media, track.Codec)
++	sourceCodec, err := backchannelCodec(codec, track.Codec)
++	if err != nil {
++		return err
++	}
+ 
+-	switch track.Codec.Name {
++	sender := core.NewSender(media, sourceCodec)
++
++	switch sourceCodec.Name {
+ 	case core.CodecPCMA:
+ 		var buf []byte
+ 
+-		if p.client.SpeakerCodec() == codecPCM {
++		if p.stream.session.speakerCodec() == codecPCM {
+ 			dst := &core.Codec{Name: core.CodecPCML, ClockRate: 8000}
+-			transcode := pcm.Transcode(dst, track.Codec)
++			transcode := pcm.Transcode(dst, sourceCodec)
+ 
+ 			sender.Handler = func(pkt *rtp.Packet) {
+ 				buf = append(buf, transcode(pkt.Payload)...)
+ 				const size = 2 * 8000 * 0.040 // 16bit 40ms
+ 				for len(buf) >= size {
+ 					p.Send += size
+-					_ = p.client.WriteAudio(codecPCM, buf[:size])
++					_ = p.stream.session.writeAudio(codecPCM, buf[:size])
+ 					buf = buf[size:]
+ 				}
+ 			}
+@@ -41,13 +47,13 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
+ 				const size = 8000 * 0.040 // 8bit 40 ms
+ 				for len(buf) >= size {
+ 					p.Send += size
+-					_ = p.client.WriteAudio(codecPCMA, buf[:size])
++					_ = p.stream.session.writeAudio(codecPCMA, buf[:size])
+ 					buf = buf[size:]
+ 				}
+ 			}
+ 		}
+ 	case core.CodecOpus:
+-		if p.client.SpeakerCodec() == codecOPUS {
++		if p.stream.session.speakerCodec() == codecOPUS {
+ 			var buf []byte
+ 			sender.Handler = func(pkt *rtp.Packet) {
+ 				if buf == nil {
+@@ -56,19 +62,49 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
+ 					// convert two 20ms to one 40ms
+ 					buf = opus.JoinFrames(buf, pkt.Payload)
+ 					p.Send += len(buf)
+-					_ = p.client.WriteAudio(codecOPUS, buf)
++					_ = p.stream.session.writeAudio(codecOPUS, buf)
+ 					buf = nil
+ 				}
+ 			}
+ 		} else {
+ 			sender.Handler = func(pkt *rtp.Packet) {
+ 				p.Send += len(pkt.Payload)
+-				_ = p.client.WriteAudio(codecOPUS, pkt.Payload)
++				_ = p.stream.session.writeAudio(codecOPUS, pkt.Payload)
+ 			}
+ 		}
++	default:
++		return fmt.Errorf("xiaomi: unsupported backchannel codec: %s", sourceCodec.Name)
+ 	}
+ 
+ 	sender.HandleRTP(track)
+ 	p.Senders = append(p.Senders, sender)
+ 	return nil
+ }
++
++func backchannelCodec(negotiated, track *core.Codec) (*core.Codec, error) {
++	if isSpecificCodec(negotiated) {
++		return negotiated, nil
++	}
++	if isSpecificCodec(track) {
++		return track, nil
++	}
++	return nil, fmt.Errorf("xiaomi: unsupported backchannel codec: %s", codecName(track))
++}
++
++func isSpecificCodec(codec *core.Codec) bool {
++	if codec == nil {
++		return false
++	}
++	switch codec.Name {
++	case "", core.CodecAny, core.CodecAll:
++		return false
++	}
++	return true
++}
++
++func codecName(codec *core.Codec) string {
++	if codec == nil {
++		return "<nil>"
++	}
++	return codec.Name
++}
+diff --git a/pkg/xiaomi/miss/classifier.go b/pkg/xiaomi/miss/classifier.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..87b0c19a334ae742eb6e465893810f8fcf38e0ae
+--- /dev/null
++++ b/pkg/xiaomi/miss/classifier.go
+@@ -0,0 +1,231 @@
++package miss
++
++import (
++	"github.com/AlexxIT/go2rtc/pkg/h264"
++	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
++	"github.com/AlexxIT/go2rtc/pkg/h265"
++)
++
++type packetClassifier struct {
++	hdrChanSeen   [2]bool          // hdr[28] values seen
++	flagsChanSeen [2]bool          // (flags >> 24) values seen
++	resolutions   map[uint32]uint8 // resolution area -> channel
++	lastTS        [2]uint64        // last timestamp per channel
++	tsInit        [2]bool          // whether lastTS is initialized
++}
++
++func newPacketClassifier() *packetClassifier {
++	return &packetClassifier{
++		resolutions: make(map[uint32]uint8),
++	}
++}
++
++// Classify runs through classification strategies in priority order.
++// The caller must serialize calls.
++func (c *packetClassifier) Classify(pkt *Packet) uint8 {
++	ch := c.classify(pkt)
++	c.lastTS[ch] = pkt.Timestamp
++	c.tsInit[ch] = true
++	return ch
++}
++
++func (c *packetClassifier) ClassifyKnown(pkt *Packet) (uint8, bool) {
++	ch, ok := c.classifyKnown(pkt)
++	if ok {
++		c.lastTS[ch] = pkt.Timestamp
++		c.tsInit[ch] = true
++	}
++	return ch, ok
++}
++
++func (c *packetClassifier) classify(pkt *Packet) uint8 {
++	// Strategy 1: hdr[28] channel field.
++	// Trusted only after seeing both 0 and 1.
++	if pkt.ChannelOK {
++		c.hdrChanSeen[pkt.Channel] = true
++		if c.hdrChanSeen[0] && c.hdrChanSeen[1] {
++			return pkt.Channel
++		}
++	}
++
++	// Strategy 2: (flags >> 24) & 0x01.
++	fch := pkt.FlagsChannel
++	c.flagsChanSeen[fch] = true
++	if c.flagsChanSeen[0] && c.flagsChanSeen[1] {
++		return fch
++	}
++
++	// Strategy 3: Resolution from SPS in keyframes.
++	if ch, ok := c.classifyByResolution(pkt); ok {
++		return ch
++	}
++
++	// Strategy 4: Timestamp continuity.
++	if c.tsInit[0] && c.tsInit[1] {
++		return c.classifyByTimestamp(pkt)
++	}
++
++	return 0
++}
++
++func (c *packetClassifier) classifyKnown(pkt *Packet) (uint8, bool) {
++	if pkt.ChannelOK {
++		c.hdrChanSeen[pkt.Channel] = true
++		if c.hdrChanSeen[0] && c.hdrChanSeen[1] {
++			return pkt.Channel, true
++		}
++	}
++
++	fch := pkt.FlagsChannel
++	c.flagsChanSeen[fch] = true
++	if c.flagsChanSeen[0] && c.flagsChanSeen[1] {
++		return fch, true
++	}
++
++	if ch, ok := c.classifyByKnownResolution(pkt); ok {
++		return ch, true
++	}
++
++	if c.tsInit[0] && c.tsInit[1] {
++		return c.classifyByTimestamp(pkt), true
++	}
++
++	return 0, false
++}
++
++// classifyByTimestamp routes by closest preceding timestamp.
++func (c *packetClassifier) classifyByTimestamp(pkt *Packet) uint8 {
++	ts := pkt.Timestamp
++
++	if ts == c.lastTS[0] {
++		return 0
++	}
++	if ts == c.lastTS[1] {
++		return 1
++	}
++
++	var d0, d1 uint64
++	if ts >= c.lastTS[0] {
++		d0 = ts - c.lastTS[0]
++	} else {
++		d0 = ^uint64(0)
++	}
++	if ts >= c.lastTS[1] {
++		d1 = ts - c.lastTS[1]
++	} else {
++		d1 = ^uint64(0)
++	}
++
++	if d0 <= d1 {
++		return 0
++	}
++	return 1
++}
++
++// classifyByResolution uses SPS from keyframes to map resolution -> channel.
++// Higher resolution = channel 0, lower = channel 1.
++func (c *packetClassifier) classifyByResolution(pkt *Packet) (uint8, bool) {
++	area := videoResolutionArea(pkt)
++	if area == 0 {
++		return 0, false
++	}
++
++	if ch, ok := c.resolutions[area]; ok {
++		return ch, true
++	}
++
++	c.assignResolution(area)
++	if ch, ok := c.resolutions[area]; ok {
++		return ch, true
++	}
++	return 0, false
++}
++
++func (c *packetClassifier) classifyByKnownResolution(pkt *Packet) (uint8, bool) {
++	area := videoResolutionArea(pkt)
++	if area == 0 {
++		return 0, false
++	}
++
++	if len(c.resolutions) >= 2 {
++		if ch, ok := c.resolutions[area]; ok {
++			return ch, true
++		}
++	}
++
++	c.assignResolution(area)
++	if len(c.resolutions) < 2 {
++		return 0, false
++	}
++	ch, ok := c.resolutions[area]
++	return ch, ok
++}
++
++// assignResolution adds a resolution and assigns channels.
++// Higher resolution -> channel 0, lower -> channel 1.
++func (c *packetClassifier) assignResolution(newArea uint32) {
++	c.resolutions[newArea] = 0
++
++	if len(c.resolutions) < 2 {
++		return
++	}
++
++	var maxArea uint32
++	for area := range c.resolutions {
++		if area > maxArea {
++			maxArea = area
++		}
++	}
++
++	for area := range c.resolutions {
++		if area == maxArea {
++			c.resolutions[area] = 0
++		} else {
++			c.resolutions[area] = 1
++		}
++	}
++}
++
++// videoResolutionArea extracts width*height from H264/H265 SPS in a keyframe.
++func videoResolutionArea(pkt *Packet) uint32 {
++	switch pkt.CodecID {
++	case codecH264:
++		avcc := annexb.EncodeToAVCC(pkt.Payload)
++		if h264.NALUType(avcc) == h264.NALUTypeSPS {
++			sps := h264.DecodeSPS(avcc[4:]) // skip 4-byte AVCC length prefix
++			if sps != nil {
++				return uint32(sps.Width()) * uint32(sps.Height())
++			}
++		}
++	case codecH265:
++		avcc := annexb.EncodeToAVCC(pkt.Payload)
++		if h265.NALUType(avcc) == h265.NALUTypeVPS {
++			// H265 keyframes start with VPS, then SPS. Find the SPS.
++			spsData := findH265SPS(avcc)
++			if spsData != nil {
++				sps := h265.DecodeSPS(spsData)
++				if sps != nil {
++					return uint32(sps.Width()) * uint32(sps.Height())
++				}
++			}
++		}
++	}
++	return 0
++}
++
++// findH265SPS searches for an SPS NALU in AVCC-formatted H265 data.
++func findH265SPS(avcc []byte) []byte {
++	for i := 0; i+4 < len(avcc); {
++		size := int(avcc[i])<<24 | int(avcc[i+1])<<16 | int(avcc[i+2])<<8 | int(avcc[i+3])
++		i += 4
++		if size <= 0 || i+size > len(avcc) {
++			break
++		}
++		naluType := (avcc[i] >> 1) & 0x3F
++		if naluType == h265.NALUTypeSPS {
++			return avcc[i : i+size]
++		}
++		i += size
++	}
++	return nil
++}
+diff --git a/pkg/xiaomi/miss/classifier_test.go b/pkg/xiaomi/miss/classifier_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2adde1a61869f4bf16af70d2ca3af8f5b75f433
+--- /dev/null
++++ b/pkg/xiaomi/miss/classifier_test.go
+@@ -0,0 +1,76 @@
++package miss
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestPacketClassifierHeaderChannelNeedsBothValues(t *testing.T) {
++	c := newPacketClassifier()
++
++	require.Equal(t, uint8(0), c.Classify(&Packet{
++		ChannelOK: true,
++		Channel:   1,
++		Timestamp: 1,
++	}))
++	require.Equal(t, uint8(0), c.Classify(&Packet{
++		ChannelOK: true,
++		Channel:   0,
++		Timestamp: 2,
++	}))
++	require.Equal(t, uint8(1), c.Classify(&Packet{
++		ChannelOK: true,
++		Channel:   1,
++		Timestamp: 3,
++	}))
++}
++
++func TestPacketClassifierFlagsChannelNeedsBothValues(t *testing.T) {
++	c := newPacketClassifier()
++
++	require.Equal(t, uint8(0), c.Classify(&Packet{
++		FlagsChannel: 1,
++		Timestamp:    1,
++	}))
++	require.Equal(t, uint8(0), c.Classify(&Packet{
++		FlagsChannel: 0,
++		Timestamp:    2,
++	}))
++	require.Equal(t, uint8(1), c.Classify(&Packet{
++		FlagsChannel: 1,
++		Timestamp:    3,
++	}))
++}
++
++func TestPacketClassifierAssignResolution(t *testing.T) {
++	c := newPacketClassifier()
++
++	c.assignResolution(640 * 360)
++	require.Equal(t, uint8(0), c.resolutions[640*360])
++
++	c.assignResolution(1920 * 1080)
++	require.Equal(t, uint8(0), c.resolutions[1920*1080])
++	require.Equal(t, uint8(1), c.resolutions[640*360])
++
++	c.assignResolution(1280 * 720)
++	require.Equal(t, uint8(0), c.resolutions[1920*1080])
++	require.Equal(t, uint8(1), c.resolutions[1280*720])
++	require.Equal(t, uint8(1), c.resolutions[640*360])
++}
++
++func TestPacketClassifierTimestampTieBreaksToChannelZero(t *testing.T) {
++	c := newPacketClassifier()
++	c.lastTS = [2]uint64{100, 100}
++	c.tsInit = [2]bool{true, true}
++
++	require.Equal(t, uint8(0), c.Classify(&Packet{Timestamp: 110}))
++}
++
++func TestPacketClassifierTimestampIgnoresBackwardsTimestamp(t *testing.T) {
++	c := newPacketClassifier()
++	c.lastTS = [2]uint64{200, 100}
++	c.tsInit = [2]bool{true, true}
++
++	require.Equal(t, uint8(1), c.Classify(&Packet{Timestamp: 150}))
++}
+diff --git a/pkg/xiaomi/miss/client.go b/pkg/xiaomi/miss/client.go
+index 3113632a1cd7521a038c564c08a3af6342be2d80..96d864cab4b94cf02ceef73f052bcbdafc6df193 100644
+--- a/pkg/xiaomi/miss/client.go
++++ b/pkg/xiaomi/miss/client.go
+@@ -126,6 +126,16 @@ func (c *Client) Version() string {
+ 	return fmt.Sprintf("%s (%s)", c.Conn.Version(), c.model)
+ }
+ 
++// IsDafangLike returns true for models that use the dafang firmware
++// protocol and do not support standard dual-channel commands.
++func (c *Client) IsDafangLike() bool {
++	switch c.model {
++	case ModelDafang, ModelXiaofang:
++		return true
++	}
++	return false
++}
++
+ func (c *Client) WriteCommand(data []byte) error {
+ 	data, err := crypto.Encode(data, c.key)
+ 	if err != nil {
+@@ -161,23 +171,7 @@ func (c *Client) StartMedia(channel, quality, audio string) error {
+ 		)
+ 	}
+ 
+-	// 0 - auto, 1 - sd, 2 - hd, default - hd
+-	switch quality {
+-	case "", "hd":
+-		// Some models have broken codec settings in quality 3.
+-		// Some models have low quality in quality 2.
+-		// Different models require different default quality settings.
+-		switch c.model {
+-		case ModelC200, ModelC300:
+-			quality = "3"
+-		default:
+-			quality = "2"
+-		}
+-	case "sd":
+-		quality = "1"
+-	case "auto":
+-		quality = "0"
+-	}
++	quality = c.normalizeQuality(quality)
+ 
+ 	if audio == "" {
+ 		audio = "1"
+@@ -193,6 +187,37 @@ func (c *Client) StartMedia(channel, quality, audio string) error {
+ 	return c.WriteCommand(data)
+ }
+ 
++// StartMediaDual starts both channel 0 and channel 1 in a single command.
++func (c *Client) StartMediaDual(quality0, quality1, audio string) error {
++	quality0 = c.normalizeQuality(quality0)
++	quality1 = c.normalizeQuality(quality1)
++	if audio == "" {
++		audio = "1"
++	}
++	data := binary.BigEndian.AppendUint32(nil, cmdVideoStart)
++	data = fmt.Appendf(data, `{"videoquality":%s,"videoquality2":%s,"enableaudio":%s}`, quality0, quality1, audio)
++	return c.WriteCommand(data)
++}
++
++// normalizeQuality converts user-facing quality strings to protocol values.
++func (c *Client) normalizeQuality(quality string) string {
++	// 0 - auto, 1 - sd, 2 - hd, default - hd
++	switch quality {
++	case "", "hd":
++		switch c.model {
++		case ModelC200, ModelC300:
++			return "3"
++		default:
++			return "2"
++		}
++	case "sd":
++		return "1"
++	case "auto":
++		return "0"
++	}
++	return quality
++}
++
+ func (c *Client) StopMedia() error {
+ 	data := binary.BigEndian.AppendUint32(nil, cmdVideoStop)
+ 	return c.WriteCommand(data)
+@@ -243,6 +268,20 @@ func (c *Client) ReadPacket() (*Packet, error) {
+ 		Payload:  payload,
+ 	}
+ 
++	// Parse channel from header for dual-channel cameras.
++	// Primary: byte 28 (some cameras set this directly).
++	if len(hdr) >= 29 {
++		ch := hdr[28]
++		if ch <= 1 {
++			pkt.Channel = ch
++			pkt.ChannelOK = true
++		}
++	}
++
++	// Secondary: high byte of flags field (flags >> 24).
++	// Some cameras encode channel here instead of in byte 28.
++	pkt.FlagsChannel = uint8((pkt.Flags >> 24) & 0x01)
++
+ 	switch c.model {
+ 	case ModelDafang, ModelXiaofang, ModelLoockV2:
+ 		// Dafang has ts in sec
+@@ -272,10 +311,13 @@ func (c *Client) WriteAudio(codecID uint32, payload []byte) error {
+ 
+ type Packet struct {
+ 	//Length    uint32
+-	CodecID   uint32
+-	Sequence  uint32
+-	Flags     uint32
+-	Timestamp uint64 // msec
++	CodecID      uint32
++	Sequence     uint32
++	Flags        uint32
++	Timestamp    uint64 // msec
++	Channel      uint8  // video channel from hdr[28]
++	ChannelOK    bool   // true if Channel was parsed (0 or 1)
++	FlagsChannel uint8  // video channel from (flags >> 24) & 0x01
+ 	//TimestampS uint32
+ 	//Reserved uint32
+ 	Payload []byte
+diff --git a/pkg/xiaomi/miss/producer.go b/pkg/xiaomi/miss/producer.go
+index dcea284e33a4d67be6e12a8a1dbd519456fc48c1..abbef81b31ac90fc55602096198189297cba7784 100644
+--- a/pkg/xiaomi/miss/producer.go
++++ b/pkg/xiaomi/miss/producer.go
+@@ -3,38 +3,48 @@ package miss
+ import (
+ 	"fmt"
+ 	"net/url"
++	"strconv"
+ 	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
+ 	"github.com/AlexxIT/go2rtc/pkg/h264"
+ 	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
+ 	"github.com/AlexxIT/go2rtc/pkg/h265"
++	"github.com/AlexxIT/go2rtc/pkg/pcm"
+ 	"github.com/pion/rtp"
+ )
+ 
+ type Producer struct {
+ 	core.Connection
+-	client *Client
++	stream *stream
+ }
+ 
+ func Dial(rawURL string) (core.Producer, error) {
+-	client, err := NewClient(rawURL)
++	u, err := url.Parse(rawURL)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-
+-	u, _ := url.Parse(rawURL)
+ 	query := u.Query()
++	channel, err := parseChannel(query)
++	if err != nil {
++		return nil, err
++	}
++
++	audio := parseAudioMode(query.Get("audio"))
++	sess, st, err := defaultSessionManager.acquire(rawURL, channel, audio)
++	if err != nil {
++		return nil, err
++	}
+ 
+-	err = client.StartMedia(query.Get("channel"), query.Get("subtype"), query.Get("audio"))
++	err = sess.startMedia(channel, query.Get("subtype"), query.Get("audio"))
+ 	if err != nil {
+-		_ = client.Close()
++		_ = st.Close()
+ 		return nil, err
+ 	}
+ 
+-	medias, err := probe(client, query.Get("audio") != "0")
++	medias, err := probe(st, audio.enabled())
+ 	if err != nil {
+-		_ = client.Close()
++		_ = st.Close()
+ 		return nil, err
+ 	}
+ 
+@@ -42,32 +52,50 @@ func Dial(rawURL string) (core.Producer, error) {
+ 		Connection: core.Connection{
+ 			ID:         core.NewID(),
+ 			FormatName: "xiaomi/miss",
+-			Protocol:   client.Protocol(),
+-			RemoteAddr: client.RemoteAddr().String(),
+-			UserAgent:  client.Version(),
++			Protocol:   sess.client.Protocol(),
++			RemoteAddr: st.RemoteAddr().String(),
++			UserAgent:  sess.client.Version(),
+ 			Medias:     medias,
+-			Transport:  client,
++			Transport:  st,
+ 		},
+-		client: client,
++		stream: st,
+ 	}, nil
+ }
+ 
+-func probe(client *Client, audio bool) ([]*core.Media, error) {
+-	_ = client.SetDeadline(time.Now().Add(15 * time.Second))
++func parseChannel(query url.Values) (uint8, error) {
++	raw := query.Get("channel")
++	switch raw {
++	case "", "0":
++		return 0, nil
++	case "1":
++		return 1, nil
++	}
++	return 0, fmt.Errorf("xiaomi: unsupported channel: %s", strconv.Quote(raw))
++}
++
++func probe(st *stream, audio bool) ([]*core.Media, error) {
++	_ = st.SetDeadline(time.Now().Add(15 * time.Second))
+ 
+ 	var vcodec, acodec *core.Codec
+ 
+ 	for {
+-		pkt, err := client.ReadPacket()
++		pkt, err := st.ReadPacket()
+ 		if err != nil {
++			// If we got video but timed out waiting for audio, that's OK
++			// for dual-channel where audio may only go to one stream.
+ 			if vcodec != nil {
+-				err = fmt.Errorf("no audio")
+-			} else if acodec != nil {
++				break
++			}
++			if acodec != nil {
+ 				err = fmt.Errorf("no video")
+ 			}
+ 			return nil, fmt.Errorf("xiaomi: probe: %w", err)
+ 		}
+ 
++		if audio && acodec == nil {
++			acodec = st.session.rememberAudioCodec(audioCodecFromPacket(pkt))
++		}
++
+ 		switch pkt.CodecID {
+ 		case codecH264:
+ 			if vcodec == nil {
+@@ -83,22 +111,24 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
+ 					vcodec = h265.AVCCToCodec(buf)
+ 				}
+ 			}
+-		case codecPCMA:
+-			if acodec == nil {
+-				acodec = &core.Codec{Name: core.CodecPCMA, ClockRate: pkt.SampleRate()}
+-			}
+-		case codecOPUS:
+-			if acodec == nil {
+-				acodec = &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
+-			}
+ 		}
+ 
+-		if vcodec != nil && (acodec != nil || !audio) {
++		if vcodec != nil {
+ 			break
+ 		}
+ 	}
+ 
+-	_ = client.SetDeadline(time.Time{})
++	_ = st.SetDeadline(time.Time{})
++
++	var talkCodec *core.Codec
++	if audio {
++		if acodec == nil {
++			if acodec = st.session.cachedAudioCodec(); acodec == nil {
++				acodec = st.session.defaultAudioCodec()
++			}
++		}
++		talkCodec = st.session.talkCodec()
++	}
+ 
+ 	medias := []*core.Media{
+ 		{
+@@ -114,25 +144,40 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
+ 			Direction: core.DirectionRecvonly,
+ 			Codecs:    []*core.Codec{acodec},
+ 		})
++	}
+ 
++	if talkCodec != nil {
+ 		medias = append(medias, &core.Media{
+ 			Kind:      core.KindAudio,
+ 			Direction: core.DirectionSendonly,
+-			Codecs:    []*core.Codec{acodec.Clone()},
++			Codecs:    []*core.Codec{talkCodec},
+ 		})
+ 	}
+ 
+ 	return medias, nil
+ }
+ 
++func audioCodecFromPacket(pkt *Packet) *core.Codec {
++	switch pkt.CodecID {
++	case codecPCM:
++		return &core.Codec{Name: core.CodecPCML, ClockRate: pkt.SampleRate()}
++	case codecPCMU:
++		return &core.Codec{Name: core.CodecPCMU, ClockRate: pkt.SampleRate()}
++	case codecPCMA:
++		return &core.Codec{Name: core.CodecPCMA, ClockRate: pkt.SampleRate()}
++	case codecOPUS:
++		return &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
++	}
++	return nil
++}
++
+ const timestamp40ms = 48000 * 0.040
+ 
+ func (p *Producer) Start() error {
+ 	var audioTS uint32
+ 
+ 	for {
+-		_ = p.client.SetDeadline(time.Now().Add(10 * time.Second))
+-		pkt, err := p.client.ReadPacket()
++		pkt, err := p.stream.ReadPacket()
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -158,6 +203,7 @@ func (p *Producer) Start() error {
+ 				name = core.CodecH265
+ 			}
+ 		case codecPCMA:
++			p.stream.session.rememberAudioCodec(audioCodecFromPacket(pkt))
+ 			name = core.CodecPCMA
+ 			pkt2 = &core.Packet{
+ 				Header: rtp.Header{
+@@ -169,7 +215,34 @@ func (p *Producer) Start() error {
+ 				Payload: pkt.Payload,
+ 			}
+ 			audioTS += uint32(len(pkt.Payload))
++		case codecPCMU:
++			p.stream.session.rememberAudioCodec(audioCodecFromPacket(pkt))
++			name = core.CodecPCMU
++			pkt2 = &core.Packet{
++				Header: rtp.Header{
++					Version:        2,
++					Marker:         true,
++					SequenceNumber: uint16(pkt.Sequence),
++					Timestamp:      audioTS,
++				},
++				Payload: pkt.Payload,
++			}
++			audioTS += uint32(len(pkt.Payload))
++		case codecPCM:
++			p.stream.session.rememberAudioCodec(audioCodecFromPacket(pkt))
++			name = core.CodecPCML
++			pkt2 = &core.Packet{
++				Header: rtp.Header{
++					Version:        2,
++					Marker:         true,
++					SequenceNumber: uint16(pkt.Sequence),
++					Timestamp:      audioTS,
++				},
++				Payload: pkt.Payload,
++			}
++			audioTS += uint32(len(pkt.Payload) / 2)
+ 		case codecOPUS:
++			p.stream.session.rememberAudioCodec(audioCodecFromPacket(pkt))
+ 			name = core.CodecOpus
+ 			pkt2 = &core.Packet{
+ 				Header: rtp.Header{
+@@ -184,17 +257,86 @@ func (p *Producer) Start() error {
+ 			audioTS += timestamp40ms
+ 		}
+ 
+-		for _, recv := range p.Receivers {
+-			if recv.Codec.Name == name {
+-				recv.WriteRTP(pkt2)
+-				break
+-			}
++		if pkt2 == nil {
++			continue
++		}
++
++		if p.writePacket(name, pkt2, pkt.SampleRate()) {
++			continue
++		}
++	}
++}
++
++func (p *Producer) writePacket(name string, pkt *core.Packet, sampleRate uint32) bool {
++	for _, recv := range p.Receivers {
++		if matchesPacketCodec(recv.Codec, name, sampleRate) {
++			recv.WriteRTP(pkt)
++			return true
++		}
++	}
++
++	if !isPCMCodecName(name) {
++		return false
++	}
++
++	for _, recv := range p.Receivers {
++		if !isPCMCodecName(recv.Codec.Name) {
++			continue
++		}
++		converted := transcodePCMPacket(pkt, name, recv.Codec, sampleRate)
++		if converted == nil {
++			continue
+ 		}
++		recv.WriteRTP(converted)
++		return true
++	}
++
++	return false
++}
++
++func transcodePCMPacket(pkt *core.Packet, srcName string, dst *core.Codec, sampleRate uint32) *core.Packet {
++	if sampleRate == 0 {
++		sampleRate = 8000
++	}
++
++	dstCodec := dst.Clone()
++	if dstCodec.ClockRate == 0 {
++		dstCodec.ClockRate = sampleRate
++	}
++	if dstCodec.Name == srcName && dstCodec.ClockRate == sampleRate {
++		return pkt
++	}
++
++	srcCodec := &core.Codec{Name: srcName, ClockRate: sampleRate}
++	payload := pcm.Transcode(dstCodec, srcCodec)(pkt.Payload)
++
++	converted := *pkt
++	converted.Payload = payload
++	if dstCodec.ClockRate != sampleRate {
++		converted.Timestamp = uint32(uint64(pkt.Timestamp) * uint64(dstCodec.ClockRate) / uint64(sampleRate))
++	}
++	return &converted
++}
++
++func matchesPacketCodec(codec *core.Codec, name string, sampleRate uint32) bool {
++	if codec.Name != name {
++		return false
++	}
++	if !isPCMCodecName(name) || sampleRate == 0 {
++		return true
++	}
++	return codec.ClockRate == 0 || codec.ClockRate == sampleRate
++}
++
++func isPCMCodecName(name string) bool {
++	switch name {
++	case core.CodecPCMA, core.CodecPCMU, core.CodecPCM, core.CodecPCML:
++		return true
+ 	}
++	return false
+ }
+ 
+ func (p *Producer) Stop() error {
+-	_ = p.client.StopMedia()
+ 	return p.Connection.Stop()
+ }
+ 
+diff --git a/pkg/xiaomi/miss/producer_test.go b/pkg/xiaomi/miss/producer_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..485983ed98316f2a66442cd2fd512d73b0bacca7
+--- /dev/null
++++ b/pkg/xiaomi/miss/producer_test.go
+@@ -0,0 +1,221 @@
++package miss
++
++import (
++	"encoding/hex"
++	"io"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
++	"github.com/stretchr/testify/require"
++)
++
++func TestProbeAddsDefaultSharedAudioMedia(t *testing.T) {
++	s := newSession(newFakeClient(), "key", nil)
++	st := newTestStream(s)
++	st.ch <- testH264Packet(t)
++
++	medias, err := probe(st, true)
++	require.NoError(t, err)
++	require.Len(t, medias, 3)
++	require.Equal(t, core.KindVideo, medias[0].Kind)
++	require.Equal(t, core.KindAudio, medias[1].Kind)
++	require.Equal(t, core.DirectionRecvonly, medias[1].Direction)
++	require.Equal(t, core.CodecPCMA, medias[1].Codecs[0].Name)
++	require.Equal(t, core.KindAudio, medias[2].Kind)
++	require.Equal(t, core.DirectionSendonly, medias[2].Direction)
++	require.Equal(t, core.CodecPCMA, medias[2].Codecs[0].Name)
++}
++
++func TestProbeUsesPCMARecvDefaultForOpusTalk(t *testing.T) {
++	client := newFakeClient()
++	client.speakerCodec = codecOPUS
++	s := newSession(client, "key", nil)
++	st := newTestStream(s)
++	st.ch <- testH264Packet(t)
++
++	medias, err := probe(st, true)
++	require.NoError(t, err)
++	require.Len(t, medias, 3)
++	require.Equal(t, core.CodecPCMA, medias[1].Codecs[0].Name)
++	require.Equal(t, core.CodecOpus, medias[2].Codecs[0].Name)
++}
++
++func TestProbeDoesNotAddSharedAudioMediaWhenDisabled(t *testing.T) {
++	s := newSession(newFakeClient(), "key", nil)
++	st := newTestStream(s)
++	st.ch <- testH264Packet(t)
++
++	medias, err := probe(st, false)
++	require.NoError(t, err)
++	require.Len(t, medias, 1)
++	require.Equal(t, core.KindVideo, medias[0].Kind)
++}
++
++func TestProbeReusesObservedSharedAudioCodec(t *testing.T) {
++	s := newSession(newFakeClient(), "key", nil)
++	st0 := newTestStream(s)
++	st0.ch <- &Packet{
++		CodecID: codecPCMU,
++		Flags:   1 << 3,
++		Payload: []byte{1, 2, 3, 4},
++	}
++	st0.ch <- testH264Packet(t)
++
++	medias0, err := probe(st0, true)
++	require.NoError(t, err)
++	require.Len(t, medias0, 3)
++	require.Equal(t, core.CodecPCMU, medias0[1].Codecs[0].Name)
++	require.Equal(t, uint32(16000), medias0[1].Codecs[0].ClockRate)
++	require.Equal(t, core.CodecPCMA, medias0[2].Codecs[0].Name)
++
++	st1 := newTestStream(s)
++	st1.ch <- testH264Packet(t)
++
++	medias1, err := probe(st1, true)
++	require.NoError(t, err)
++	require.Len(t, medias1, 3)
++	require.Equal(t, core.CodecPCMU, medias1[1].Codecs[0].Name)
++	require.Equal(t, uint32(16000), medias1[1].Codecs[0].ClockRate)
++	require.Equal(t, core.CodecPCMA, medias1[2].Codecs[0].Name)
++}
++
++func TestProducerStartHandlesSharedAudioCodecs(t *testing.T) {
++	s := newSession(newFakeClient(), "key", nil)
++	st := newTestStream(s)
++
++	pcmuCodec := &core.Codec{Name: core.CodecPCMU, ClockRate: 8000}
++	pcmlCodec := &core.Codec{Name: core.CodecPCML, ClockRate: 8000}
++	pcmuReceiver := core.NewReceiver(&core.Media{Kind: core.KindAudio}, pcmuCodec)
++	pcmlReceiver := core.NewReceiver(&core.Media{Kind: core.KindAudio}, pcmlCodec)
++
++	p := &Producer{
++		Connection: core.Connection{
++			Receivers: []*core.Receiver{pcmuReceiver, pcmlReceiver},
++		},
++		stream: st,
++	}
++
++	errCh := make(chan error, 1)
++	go func() {
++		errCh <- p.Start()
++	}()
++
++	st.ch <- &Packet{CodecID: codecPCMU, Sequence: 1, Payload: []byte{1, 2, 3, 4}}
++	st.ch <- &Packet{CodecID: codecPCM, Sequence: 2, Payload: []byte{1, 0, 2, 0}}
++	closeWhenDrained(st)
++
++	require.ErrorIs(t, <-errCh, io.EOF)
++	require.Equal(t, 1, pcmuReceiver.Packets)
++	require.Equal(t, 1, pcmlReceiver.Packets)
++}
++
++func TestProducerStartTranscodesSharedPCMToDefaultAudioReceiver(t *testing.T) {
++	s := newSession(newFakeClient(), "key", nil)
++	st := newTestStream(s)
++
++	pcmaCodec := &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
++	pcmaReceiver := core.NewReceiver(&core.Media{Kind: core.KindAudio}, pcmaCodec)
++
++	p := &Producer{
++		Connection: core.Connection{
++			Receivers: []*core.Receiver{pcmaReceiver},
++		},
++		stream: st,
++	}
++
++	errCh := make(chan error, 1)
++	go func() {
++		errCh <- p.Start()
++	}()
++
++	st.ch <- &Packet{CodecID: codecPCMU, Sequence: 1, Payload: []byte{0x7F, 0x7E, 0x7D, 0x7C}}
++	st.ch <- &Packet{CodecID: codecPCM, Sequence: 2, Payload: []byte{1, 0, 2, 0}}
++	closeWhenDrained(st)
++
++	require.ErrorIs(t, <-errCh, io.EOF)
++	require.Equal(t, 2, pcmaReceiver.Packets)
++}
++
++func TestProducerStartResamplesSameSharedAudioCodec(t *testing.T) {
++	s := newSession(newFakeClient(), "key", nil)
++	st := newTestStream(s)
++
++	pcmaCodec := &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
++	pcmaReceiver := core.NewReceiver(&core.Media{Kind: core.KindAudio}, pcmaCodec)
++	var packets []*core.Packet
++	pcmaReceiver.AppendChild(&core.Node{
++		Input: func(pkt *core.Packet) {
++			clone := *pkt
++			clone.Payload = append([]byte(nil), pkt.Payload...)
++			packets = append(packets, &clone)
++		},
++	})
++
++	p := &Producer{
++		Connection: core.Connection{
++			Receivers: []*core.Receiver{pcmaReceiver},
++		},
++		stream: st,
++	}
++
++	errCh := make(chan error, 1)
++	go func() {
++		errCh <- p.Start()
++	}()
++
++	st.ch <- &Packet{CodecID: codecPCMA, Sequence: 1, Flags: 1 << 3, Payload: []byte{0xD5, 0xD6, 0xD7, 0xD8}}
++	st.ch <- &Packet{CodecID: codecPCMA, Sequence: 2, Flags: 1 << 3, Payload: []byte{0xD9, 0xDA, 0xDB, 0xDC}}
++	closeWhenDrained(st)
++
++	require.ErrorIs(t, <-errCh, io.EOF)
++	require.Len(t, packets, 2)
++	require.Len(t, packets[0].Payload, 2)
++	require.Equal(t, uint32(2), packets[1].Timestamp)
++}
++
++func TestBackchannelCodecUsesNegotiatedCodecForAnyTrack(t *testing.T) {
++	codec, err := backchannelCodec(
++		&core.Codec{Name: core.CodecPCMA, ClockRate: 8000},
++		&core.Codec{Name: core.CodecAny},
++	)
++	require.NoError(t, err)
++	require.Equal(t, core.CodecPCMA, codec.Name)
++}
++
++func TestBackchannelCodecRejectsUnresolvedAnyTrack(t *testing.T) {
++	_, err := backchannelCodec(nil, &core.Codec{Name: core.CodecAny})
++	require.Error(t, err)
++}
++
++func newTestStream(s *session) *stream {
++	st := &stream{
++		session: s,
++		ch:      make(chan *Packet, 10),
++		done:    make(chan struct{}),
++	}
++	st.deadline.Store(time.Time{})
++	return st
++}
++
++func closeWhenDrained(st *stream) {
++	go func() {
++		for len(st.ch) > 0 {
++			time.Sleep(time.Millisecond)
++		}
++		st.close()
++	}()
++}
++
++func testH264Packet(t *testing.T) *Packet {
++	t.Helper()
++
++	avcc, err := hex.DecodeString("000000196764001fac2484014016ec0440000003004000000c23c60c920000000568ee32c8b0000000d365")
++	require.NoError(t, err)
++
++	return &Packet{
++		CodecID: codecH264,
++		Payload: annexb.DecodeAVCC(avcc, true),
++	}
++}
+diff --git a/pkg/xiaomi/miss/session.go b/pkg/xiaomi/miss/session.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a675a334be4440b7efe06243fe34e5267507d730
+--- /dev/null
++++ b/pkg/xiaomi/miss/session.go
+@@ -0,0 +1,633 @@
++package miss
++
++import (
++	"errors"
++	"io"
++	"net"
++	"net/url"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++)
++
++// session manages a single MISS client connection that can serve multiple
++// streams (channels). For dual-channel cameras, both channel 0 and channel 1
++// share the same underlying UDP/TCP session to avoid exhausting the camera's
++// limited connection slots.
++type session struct {
++	client  sessionClient
++	key     string // cache key: host|did
++	manager *sessionManager
++
++	mu      sync.Mutex
++	streams map[*stream]struct{}
++	state   sessionState
++	reason  shutdownReason
++
++	// startedMask tracks which channels have been started (bit 0 = ch0, bit 1 = ch1).
++	startedMask  uint8
++	quality      [2]string // remembered quality per channel
++	mediaAudio   bool
++	audioStarted bool
++
++	workerOnce sync.Once
++	workerDone chan struct{}
++
++	speakerOnce sync.Once
++	speakerErr  error
++
++	audioCodec *core.Codec
++	classifier *packetClassifier
++}
++
++// stream represents a single channel's view of a session. It receives
++// packets dispatched by the session worker and provides a ReadPacket
++// interface compatible with what the Producer expects.
++type stream struct {
++	session *session
++	channel uint8
++	audio   audioMode
++	ch      chan *Packet
++
++	closeOnce sync.Once
++	deadline  atomic.Value // time.Time
++	done      chan struct{}
++}
++
++type sessionClient interface {
++	Protocol() string
++	Version() string
++	IsDafangLike() bool
++	StartMedia(channel, quality, audio string) error
++	StartMediaDual(quality0, quality1, audio string) error
++	StartAudio() error
++	StopMedia() error
++	StartSpeaker() error
++	SpeakerCodec() uint32
++	WriteAudio(codecID uint32, payload []byte) error
++	ReadPacket() (*Packet, error)
++	RemoteAddr() net.Addr
++	SetDeadline(t time.Time) error
++	Close() error
++}
++
++type sessionState uint8
++
++const (
++	sessionActive sessionState = iota
++	sessionClosing
++	sessionClosed
++)
++
++type shutdownReason uint8
++
++const (
++	shutdownReadError shutdownReason = iota
++	shutdownNoStreams
++)
++
++const (
++	stopMediaTimeout  = time.Second
++	workerStopTimeout = time.Second
++)
++
++var errSessionClosing = errors.New("miss: session is closing")
++
++type audioMode uint8
++
++const (
++	audioDisabled audioMode = iota
++	audioVideoStart
++	audioCommandStart
++)
++
++func parseAudioMode(raw string) audioMode {
++	switch raw {
++	case "0":
++		return audioDisabled
++	case "2":
++		return audioCommandStart
++	default:
++		return audioVideoStart
++	}
++}
++
++func (m audioMode) enabled() bool {
++	return m != audioDisabled
++}
++
++// sessionKey builds a cache key from the URL. Two URLs pointing to the same
++// camera (same host and did) will share a session.
++func sessionKey(rawURL string) (string, error) {
++	u, err := url.Parse(rawURL)
++	if err != nil {
++		return "", err
++	}
++	key := u.Host
++	if did := u.Query().Get("did"); did != "" {
++		key += "|" + did
++	}
++	return key, nil
++}
++
++func newSession(client sessionClient, key string, manager *sessionManager) *session {
++	return &session{
++		client:     client,
++		key:        key,
++		manager:    manager,
++		streams:    make(map[*stream]struct{}),
++		state:      sessionActive,
++		workerDone: make(chan struct{}),
++		classifier: newPacketClassifier(),
++	}
++}
++
++// openStream creates a new stream for the given channel on this session.
++func (s *session) openStream(channel uint8, audio audioMode) (*stream, error) {
++	s.mu.Lock()
++	st, err := s.openStreamLocked(channel, audio)
++	s.mu.Unlock()
++	if err != nil {
++		return nil, err
++	}
++	s.startWorker()
++	return st, nil
++}
++
++// openStreamLocked creates a new stream while s.mu is held.
++func (s *session) openStreamLocked(channel uint8, audio audioMode) (*stream, error) {
++	if s.state != sessionActive {
++		return nil, errSessionClosing
++	}
++
++	st := &stream{
++		session: s,
++		channel: channel,
++		audio:   audio,
++		ch:      make(chan *Packet, 100),
++		done:    make(chan struct{}),
++	}
++	st.deadline.Store(time.Time{})
++
++	s.streams[st] = struct{}{}
++	return st, nil
++}
++
++func (s *session) startWorker() {
++	s.workerOnce.Do(func() {
++		go s.worker()
++	})
++}
++
++// startMedia sends the appropriate VideoStart command. If only one channel is
++// active, it sends a single-channel command. If both channels are active, it
++// sends a dual-channel command.
++func (s *session) startMedia(channel uint8, quality, _ string) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	ch := int(channel)
++	if ch > 1 {
++		ch = 0
++	}
++
++	// Already started this channel.
++	if s.startedMask&(1<<ch) != 0 {
++		if !s.mediaAudio && s.audioEnabledLocked() {
++			return s.enableAudioLocked()
++		}
++		if s.shouldStartAudioLocked() {
++			s.startAudioLocked()
++		}
++		return nil
++	}
++
++	s.quality[ch] = quality
++	other := ch ^ 1
++	audio := s.audioParamLocked()
++
++	// If the other channel is already started, upgrade to dual-channel.
++	if s.startedMask&(1<<other) != 0 {
++		err := s.client.StartMediaDual(
++			s.quality[0], s.quality[1], audio,
++		)
++		if err != nil {
++			return err
++		}
++		s.startedMask |= 1 << ch
++		s.mediaAudio = audio != "0"
++		if s.shouldStartAudioLocked() {
++			s.startAudioLocked()
++		}
++		return nil
++	}
++
++	// Single channel start.
++	chStr := "0"
++	if channel == 1 {
++		chStr = "1"
++	}
++	if err := s.client.StartMedia(chStr, quality, audio); err != nil {
++		return err
++	}
++	s.startedMask |= 1 << ch
++	s.mediaAudio = audio != "0"
++	if s.shouldStartAudioLocked() {
++		s.startAudioLocked()
++	}
++	return nil
++}
++
++func (s *session) audioEnabledLocked() bool {
++	for st := range s.streams {
++		if st.audio.enabled() {
++			return true
++		}
++	}
++	return false
++}
++
++func (s *session) audioCommandEnabledLocked() bool {
++	for st := range s.streams {
++		if st.audio == audioCommandStart {
++			return true
++		}
++	}
++	return false
++}
++
++func (s *session) audioParamLocked() string {
++	if s.audioEnabledLocked() {
++		return "1"
++	}
++	return "0"
++}
++
++func (s *session) enableAudioLocked() error {
++	if s.startedMask == 0 {
++		return nil
++	}
++
++	var err error
++	if s.startedMask == 0b11 {
++		err = s.client.StartMediaDual(s.quality[0], s.quality[1], "1")
++	} else {
++		ch := uint8(0)
++		if s.startedMask&0b10 != 0 {
++			ch = 1
++		}
++		err = s.client.StartMedia(channelString(ch), s.quality[ch], "1")
++	}
++	if err != nil {
++		return err
++	}
++	s.mediaAudio = true
++	if s.shouldStartAudioLocked() {
++		s.startAudioLocked()
++	}
++	return nil
++}
++
++func (s *session) shouldStartAudioLocked() bool {
++	if s.audioStarted || s.client.IsDafangLike() || !s.audioEnabledLocked() {
++		return false
++	}
++	return s.startedMask == 0b11 || s.audioCommandEnabledLocked()
++}
++
++func (s *session) startAudioLocked() {
++	_ = s.client.StartAudio()
++	s.audioStarted = true
++}
++
++func channelString(channel uint8) string {
++	if channel == 1 {
++		return "1"
++	}
++	return "0"
++}
++
++// worker is the read loop that dispatches packets to streams.
++func (s *session) worker() {
++	defer close(s.workerDone)
++
++	for {
++		_ = s.client.SetDeadline(time.Now().Add(10 * time.Second))
++
++		pkt, err := s.client.ReadPacket()
++		if err != nil {
++			s.shutdown(shutdownReadError)
++			return
++		}
++
++		s.dispatch(pkt)
++	}
++}
++
++// dispatch routes a packet to the appropriate stream(s).
++func (s *session) dispatch(pkt *Packet) {
++	s.mu.Lock()
++	if len(s.streams) == 0 {
++		s.mu.Unlock()
++		return
++	}
++
++	streams := make([]*stream, 0, len(s.streams))
++	for st := range s.streams {
++		streams = append(streams, st)
++	}
++
++	// Audio packets are broadcast to all streams.
++	if isAudioCodec(pkt.CodecID) {
++		s.mu.Unlock()
++		for _, st := range streams {
++			st.push(pkt)
++		}
++		return
++	}
++
++	// Single stream before dual mode: send all video to it, no classification needed.
++	if len(streams) == 1 && s.startedMask != 0b11 {
++		s.mu.Unlock()
++		streams[0].push(pkt)
++		return
++	}
++
++	if len(streams) == 1 {
++		ch, ok := s.classifier.ClassifyKnown(pkt)
++		s.mu.Unlock()
++		if !ok || streams[0].channel == ch {
++			streams[0].push(pkt)
++		}
++		return
++	}
++
++	// Multiple streams: classify and route. Already holding mu.
++	ch := s.classifier.Classify(pkt)
++	s.mu.Unlock()
++
++	for _, st := range streams {
++		if st.channel == ch {
++			st.push(pkt)
++		}
++	}
++}
++
++// startSpeaker starts the speaker on the session (once).
++func (s *session) startSpeaker() error {
++	s.speakerOnce.Do(func() {
++		s.speakerErr = s.client.StartSpeaker()
++	})
++	return s.speakerErr
++}
++
++// writeAudio sends audio data to the camera.
++func (s *session) writeAudio(codecID uint32, payload []byte) error {
++	return s.client.WriteAudio(codecID, payload)
++}
++
++// speakerCodec returns the speaker codec for the camera model.
++func (s *session) speakerCodec() uint32 {
++	return s.client.SpeakerCodec()
++}
++
++func (s *session) rememberAudioCodec(codec *core.Codec) *core.Codec {
++	if codec == nil {
++		return nil
++	}
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	if s.audioCodec == nil {
++		s.audioCodec = codec.Clone()
++	}
++	return s.audioCodec.Clone()
++}
++
++func (s *session) cachedAudioCodec() *core.Codec {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	if s.audioCodec == nil {
++		return nil
++	}
++	return s.audioCodec.Clone()
++}
++
++func (s *session) defaultAudioCodec() *core.Codec {
++	return &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
++}
++
++func (s *session) talkCodec() *core.Codec {
++	switch s.speakerCodec() {
++	case codecOPUS:
++		return &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
++	default:
++		return &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
++	}
++}
++
++// removeStream removes a stream from the session. If no streams remain, the
++// session is shut down.
++func (s *session) removeStream(st *stream) {
++	var shutdown bool
++
++	s.mu.Lock()
++	if _, ok := s.streams[st]; !ok {
++		s.mu.Unlock()
++		return
++	}
++	delete(s.streams, st)
++	if len(s.streams) == 0 && s.state == sessionActive {
++		s.state = sessionClosing
++		s.reason = shutdownNoStreams
++		shutdown = true
++	}
++	s.mu.Unlock()
++
++	st.close()
++
++	if shutdown {
++		s.completeShutdown(shutdownNoStreams, nil)
++	}
++}
++
++// shutdown tears down the session, closing all streams and the client.
++func (s *session) shutdown(reason shutdownReason) {
++	streams, ok := s.beginShutdown(reason)
++	if !ok {
++		return
++	}
++	s.completeShutdown(reason, streams)
++}
++
++func (s *session) completeShutdown(reason shutdownReason, streams []*stream) {
++	if s.manager != nil {
++		s.manager.remove(s)
++	}
++
++	for _, st := range streams {
++		st.close()
++	}
++
++	if reason == shutdownNoStreams {
++		s.stopMedia()
++	}
++	_ = s.client.Close()
++
++	if reason == shutdownNoStreams {
++		s.waitWorkerDone()
++	}
++
++	s.finishShutdown()
++}
++
++func (s *session) beginShutdown(reason shutdownReason) ([]*stream, bool) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	if s.state != sessionActive {
++		return nil, false
++	}
++	s.state = sessionClosing
++	s.reason = reason
++
++	streams := make([]*stream, 0, len(s.streams))
++	for st := range s.streams {
++		streams = append(streams, st)
++	}
++	s.streams = make(map[*stream]struct{})
++	return streams, true
++}
++
++func (s *session) finishShutdown() {
++	s.mu.Lock()
++	s.state = sessionClosed
++	s.mu.Unlock()
++}
++
++func (s *session) isActiveLocked() bool {
++	return s.state == sessionActive
++}
++
++func (s *session) stopMedia() {
++	_ = s.client.SetDeadline(time.Now().Add(stopMediaTimeout))
++
++	done := make(chan struct{})
++	go func() {
++		_ = s.client.StopMedia()
++		close(done)
++	}()
++
++	timer := time.NewTimer(stopMediaTimeout)
++	defer timer.Stop()
++
++	select {
++	case <-done:
++	case <-timer.C:
++	}
++}
++
++func (s *session) waitWorkerDone() {
++	timer := time.NewTimer(workerStopTimeout)
++	defer timer.Stop()
++
++	select {
++	case <-s.workerDone:
++	case <-timer.C:
++	}
++}
++
++// --- stream methods ---
++
++// ReadPacket reads the next packet for this stream, respecting deadlines.
++func (st *stream) ReadPacket() (*Packet, error) {
++	deadline, _ := st.deadline.Load().(time.Time)
++	if deadline.IsZero() {
++		select {
++		case pkt := <-st.ch:
++			return pkt, nil
++		case <-st.done:
++			return nil, io.EOF
++		}
++	}
++
++	d := time.Until(deadline)
++	if d <= 0 {
++		// Check if there's already a packet available.
++		select {
++		case pkt := <-st.ch:
++			return pkt, nil
++		default:
++			return nil, &net.OpError{Op: "read", Err: &timeoutError{}}
++		}
++	}
++
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++
++	select {
++	case pkt := <-st.ch:
++		return pkt, nil
++	case <-st.done:
++		return nil, io.EOF
++	case <-timer.C:
++		return nil, &net.OpError{Op: "read", Err: &timeoutError{}}
++	}
++}
++
++// SetDeadline sets a read deadline for this stream.
++func (st *stream) SetDeadline(t time.Time) error {
++	st.deadline.Store(t)
++	return nil
++}
++
++// RemoteAddr returns the remote address of the underlying connection.
++func (st *stream) RemoteAddr() net.Addr {
++	return st.session.client.RemoteAddr()
++}
++
++// Close removes this stream from the session.
++func (st *stream) Close() error {
++	st.session.removeStream(st)
++	return nil
++}
++
++func (st *stream) push(pkt *Packet) {
++	select {
++	case <-st.done:
++		return
++	default:
++	}
++	select {
++	case st.ch <- pkt:
++	default:
++		// Drop packet if the buffer is full.
++	}
++}
++
++func (st *stream) close() {
++	st.closeOnce.Do(func() {
++		close(st.done)
++	})
++}
++
++// --- helpers ---
++
++func isAudioCodec(codecID uint32) bool {
++	switch codecID {
++	case codecPCM, codecPCMU, codecPCMA, codecOPUS:
++		return true
++	}
++	return false
++}
++
++// timeoutError implements the net.Error interface for deadline timeouts.
++type timeoutError struct{}
++
++func (e *timeoutError) Error() string   { return "i/o timeout" }
++func (e *timeoutError) Timeout() bool   { return true }
++func (e *timeoutError) Temporary() bool { return true }
+diff --git a/pkg/xiaomi/miss/session_manager.go b/pkg/xiaomi/miss/session_manager.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ced8f90a812643cd56698fdd8b8d691e509794e4
+--- /dev/null
++++ b/pkg/xiaomi/miss/session_manager.go
+@@ -0,0 +1,120 @@
++package miss
++
++import "sync"
++
++type clientFactory func(rawURL string) (sessionClient, error)
++
++func defaultClientFactory(rawURL string) (sessionClient, error) {
++	return NewClient(rawURL)
++}
++
++// sessionManager owns shared MISS sessions. It never dials while holding mu;
++// when both manager and session locks are needed, acquire manager.mu first.
++type sessionManager struct {
++	mu        sync.Mutex
++	sessions  map[string]*session
++	newClient clientFactory
++}
++
++var defaultSessionManager = newSessionManager(defaultClientFactory)
++
++func newSessionManager(newClient clientFactory) *sessionManager {
++	return &sessionManager{
++		sessions:  make(map[string]*session),
++		newClient: newClient,
++	}
++}
++
++func (m *sessionManager) acquire(rawURL string, channel uint8, audio audioMode) (*session, *stream, error) {
++	key, err := sessionKey(rawURL)
++	if err != nil {
++		return nil, nil, err
++	}
++
++	if s, st, ok := m.acquireExisting(key, channel, audio); ok {
++		return s, st, nil
++	}
++
++	client, err := m.newClient(rawURL)
++	if err != nil {
++		return nil, nil, err
++	}
++
++	// Dafang-like models: no session sharing, return standalone session.
++	if client.IsDafangLike() {
++		s := newSession(client, key, nil)
++		st, err := s.openStream(channel, audio)
++		if err != nil {
++			_ = client.Close()
++			return nil, nil, err
++		}
++		return s, st, nil
++	}
++
++	s := newSession(client, key, m)
++
++	m.mu.Lock()
++	if existing, ok := m.sessions[key]; ok {
++		existing.mu.Lock()
++		if existing.isActiveLocked() && !existing.client.IsDafangLike() {
++			st, err := existing.openStreamLocked(channel, audio)
++			existing.mu.Unlock()
++			m.mu.Unlock()
++			_ = client.Close()
++			if err != nil {
++				return nil, nil, err
++			}
++			existing.startWorker()
++			return existing, st, nil
++		}
++		existing.mu.Unlock()
++	}
++
++	s.mu.Lock()
++	st, err := s.openStreamLocked(channel, audio)
++	s.mu.Unlock()
++	if err != nil {
++		m.mu.Unlock()
++		_ = client.Close()
++		return nil, nil, err
++	}
++	m.sessions[key] = s
++	m.mu.Unlock()
++
++	s.startWorker()
++	return s, st, nil
++}
++
++func (m *sessionManager) acquireExisting(key string, channel uint8, audio audioMode) (*session, *stream, bool) {
++	m.mu.Lock()
++	s, ok := m.sessions[key]
++	if !ok {
++		m.mu.Unlock()
++		return nil, nil, false
++	}
++
++	s.mu.Lock()
++	if !s.isActiveLocked() || s.client.IsDafangLike() {
++		s.mu.Unlock()
++		m.mu.Unlock()
++		return nil, nil, false
++	}
++
++	st, err := s.openStreamLocked(channel, audio)
++	s.mu.Unlock()
++	m.mu.Unlock()
++	if err != nil {
++		return nil, nil, false
++	}
++
++	s.startWorker()
++	return s, st, true
++}
++
++func (m *sessionManager) remove(s *session) {
++	m.mu.Lock()
++	if m.sessions[s.key] == s {
++		delete(m.sessions, s.key)
++	}
++	m.mu.Unlock()
++}
+diff --git a/pkg/xiaomi/miss/session_manager_test.go b/pkg/xiaomi/miss/session_manager_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..6bed8184784e4c5a95dc1c000ba86cee6d57c981
+--- /dev/null
++++ b/pkg/xiaomi/miss/session_manager_test.go
+@@ -0,0 +1,574 @@
++package miss
++
++import (
++	"errors"
++	"io"
++	"net"
++	"net/url"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++type fakeAddr string
++
++func (a fakeAddr) Network() string { return "fake" }
++func (a fakeAddr) String() string  { return string(a) }
++
++type fakeClient struct {
++	mu sync.Mutex
++
++	dafang bool
++
++	startMediaChannels  []string
++	startMediaAudio     []string
++	startMediaDual      int
++	startMediaDualAudio []string
++	startMediaDualErr   error
++	startAudio          int
++	startAudioErr       error
++	stopMedia           int
++	startSpeaker        int
++	writeAudio          int
++	closeCount          int
++	speakerCodec        uint32
++
++	closed    chan struct{}
++	closeOnce sync.Once
++	readErr   chan error
++}
++
++func newFakeClient() *fakeClient {
++	return &fakeClient{
++		closed:  make(chan struct{}),
++		readErr: make(chan error, 1),
++	}
++}
++
++func (c *fakeClient) Protocol() string { return "fake" }
++func (c *fakeClient) Version() string  { return "fake (model)" }
++func (c *fakeClient) IsDafangLike() bool {
++	return c.dafang
++}
++
++func (c *fakeClient) StartMedia(channel, _, audio string) error {
++	c.mu.Lock()
++	c.startMediaChannels = append(c.startMediaChannels, channel)
++	c.startMediaAudio = append(c.startMediaAudio, audio)
++	c.mu.Unlock()
++	return nil
++}
++
++func (c *fakeClient) StartMediaDual(_, _, audio string) error {
++	c.mu.Lock()
++	c.startMediaDual++
++	c.startMediaDualAudio = append(c.startMediaDualAudio, audio)
++	err := c.startMediaDualErr
++	c.mu.Unlock()
++	return err
++}
++
++func (c *fakeClient) StartAudio() error {
++	c.mu.Lock()
++	c.startAudio++
++	err := c.startAudioErr
++	c.mu.Unlock()
++	return err
++}
++
++func (c *fakeClient) StopMedia() error {
++	c.mu.Lock()
++	c.stopMedia++
++	c.mu.Unlock()
++	return nil
++}
++
++func (c *fakeClient) StartSpeaker() error {
++	c.mu.Lock()
++	c.startSpeaker++
++	c.mu.Unlock()
++	return nil
++}
++
++func (c *fakeClient) SpeakerCodec() uint32 {
++	if c.speakerCodec != 0 {
++		return c.speakerCodec
++	}
++	return codecPCMA
++}
++
++func (c *fakeClient) WriteAudio(uint32, []byte) error {
++	c.mu.Lock()
++	c.writeAudio++
++	c.mu.Unlock()
++	return nil
++}
++
++func (c *fakeClient) ReadPacket() (*Packet, error) {
++	select {
++	case err := <-c.readErr:
++		if err == nil {
++			err = io.EOF
++		}
++		return nil, err
++	case <-c.closed:
++		return nil, io.EOF
++	}
++}
++
++func (c *fakeClient) RemoteAddr() net.Addr { return fakeAddr("fake") }
++func (c *fakeClient) SetDeadline(time.Time) error {
++	return nil
++}
++
++func (c *fakeClient) Close() error {
++	c.closeOnce.Do(func() {
++		c.mu.Lock()
++		c.closeCount++
++		c.mu.Unlock()
++		close(c.closed)
++	})
++	return nil
++}
++
++func (c *fakeClient) counts() (stopMedia, closeCount, startMediaDual int, startMediaChannels []string) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.stopMedia, c.closeCount, c.startMediaDual, append([]string(nil), c.startMediaChannels...)
++}
++
++func (c *fakeClient) audioCommands() (startMediaAudio, startMediaDualAudio []string, startAudio int) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return append([]string(nil), c.startMediaAudio...), append([]string(nil), c.startMediaDualAudio...), c.startAudio
++}
++
++func TestSessionManagerAcquireReusesActiveSession(t *testing.T) {
++	client := newFakeClient()
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		return client, nil
++	})
++
++	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	s2, st2, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	require.NoError(t, err)
++	require.Same(t, s1, s2)
++	require.Equal(t, uint8(0), st1.channel)
++	require.Equal(t, uint8(1), st2.channel)
++
++	require.NoError(t, st1.Close())
++	require.NoError(t, st2.Close())
++	waitWorker(t, s1)
++}
++
++func TestSessionManagerDoesNotShareDafangLikeSession(t *testing.T) {
++	var clients []*fakeClient
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		client := newFakeClient()
++		client.dafang = true
++		clients = append(clients, client)
++		return client, nil
++	})
++
++	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	s2, st2, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	require.NoError(t, err)
++	require.NotSame(t, s1, s2)
++	require.Len(t, clients, 2)
++
++	require.NoError(t, st1.Close())
++	require.NoError(t, st2.Close())
++	waitWorker(t, s1)
++	waitWorker(t, s2)
++}
++
++func TestSessionReadErrorShutdownSkipsStopMedia(t *testing.T) {
++	client := newFakeClient()
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		return client, nil
++	})
++
++	s, _, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++
++	client.readErr <- errors.New("read failed")
++	waitWorker(t, s)
++
++	stopMedia, closeCount, _, _ := client.counts()
++	require.Equal(t, 0, stopMedia)
++	require.Equal(t, 1, closeCount)
++}
++
++func TestSessionNoStreamsShutdownStopsMedia(t *testing.T) {
++	client := newFakeClient()
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		return client, nil
++	})
++
++	s, st, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	require.NoError(t, st.Close())
++	waitWorker(t, s)
++
++	stopMedia, closeCount, _, _ := client.counts()
++	require.Equal(t, 1, stopMedia)
++	require.Equal(t, 1, closeCount)
++}
++
++func TestSessionStartMediaDualUpgrade(t *testing.T) {
++	client := newFakeClient()
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		return client, nil
++	})
++
++	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(0, "hd", "1"))
++	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(1, "sd", "1"))
++
++	_, _, startMediaDual, startMediaChannels := client.counts()
++	_, _, startAudio := client.audioCommands()
++	require.Equal(t, []string{"0"}, startMediaChannels)
++	require.Equal(t, 1, startMediaDual)
++	require.Equal(t, 1, startAudio)
++	require.Equal(t, uint8(0b11), s.startedMask)
++
++	require.NoError(t, st1.Close())
++	require.NoError(t, st0.Close())
++	waitWorker(t, s)
++}
++
++func TestSessionStartMediaDualKeepsSharedAudioEnabled(t *testing.T) {
++	client := newFakeClient()
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		return client, nil
++	})
++
++	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(0, "hd", "1"))
++	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioDisabled)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(1, "sd", "0"))
++
++	startMediaAudio, startMediaDualAudio, startAudio := client.audioCommands()
++	require.Equal(t, []string{"1"}, startMediaAudio)
++	require.Equal(t, []string{"1"}, startMediaDualAudio)
++	require.Equal(t, 1, startAudio)
++
++	require.NoError(t, st1.Close())
++	require.NoError(t, st0.Close())
++	waitWorker(t, s)
++}
++
++func TestSessionStartMediaEnablesAudioForAlreadyStartedChannel(t *testing.T) {
++	client := newFakeClient()
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		return client, nil
++	})
++
++	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioDisabled)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(0, "hd", "0"))
++	_, st1, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(0, "hd", "1"))
++
++	startMediaAudio, startMediaDualAudio, startAudio := client.audioCommands()
++	require.Equal(t, []string{"0", "1"}, startMediaAudio)
++	require.Empty(t, startMediaDualAudio)
++	require.Equal(t, 0, startAudio)
++
++	require.NoError(t, st1.Close())
++	require.NoError(t, st0.Close())
++	waitWorker(t, s)
++}
++
++func TestSessionStartMediaStartsAudioCommandForExplicitAudio2(t *testing.T) {
++	client := newFakeClient()
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		return client, nil
++	})
++
++	s, st, err := manager.acquire("xiaomi://host?did=1", 0, audioCommandStart)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(0, "hd", "2"))
++
++	startMediaAudio, startMediaDualAudio, startAudio := client.audioCommands()
++	require.Equal(t, []string{"1"}, startMediaAudio)
++	require.Empty(t, startMediaDualAudio)
++	require.Equal(t, 1, startAudio)
++
++	require.NoError(t, st.Close())
++	waitWorker(t, s)
++}
++
++func TestSessionStartMediaIgnoresAudioStartCommandError(t *testing.T) {
++	client := newFakeClient()
++	client.startAudioErr = errors.New("audio start failed")
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		return client, nil
++	})
++
++	s, st, err := manager.acquire("xiaomi://host?did=1", 0, audioCommandStart)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(0, "hd", "2"))
++
++	_, _, startAudio := client.audioCommands()
++	require.Equal(t, 1, startAudio)
++
++	require.NoError(t, st.Close())
++	waitWorker(t, s)
++}
++
++func TestSessionStartMediaDoesNotStartSharedAudioWhenDisabled(t *testing.T) {
++	client := newFakeClient()
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		return client, nil
++	})
++
++	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioDisabled)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(0, "hd", "0"))
++	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioDisabled)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(1, "sd", "0"))
++
++	startMediaAudio, startMediaDualAudio, startAudio := client.audioCommands()
++	require.Equal(t, []string{"0"}, startMediaAudio)
++	require.Equal(t, []string{"0"}, startMediaDualAudio)
++	require.Equal(t, 0, startAudio)
++
++	require.NoError(t, st1.Close())
++	require.NoError(t, st0.Close())
++	waitWorker(t, s)
++}
++
++func TestSessionDispatchClassifiesAfterDualStreamCloses(t *testing.T) {
++	s := newSession(newFakeClient(), "key", nil)
++
++	s.mu.Lock()
++	st0, err := s.openStreamLocked(0, audioVideoStart)
++	require.NoError(t, err)
++	st1, err := s.openStreamLocked(1, audioVideoStart)
++	require.NoError(t, err)
++	s.startedMask = 0b11
++	s.mu.Unlock()
++
++	prime0 := &Packet{CodecID: 0xFFFF, FlagsChannel: 0}
++	prime1 := &Packet{CodecID: 0xFFFF, FlagsChannel: 1}
++	s.dispatch(prime0)
++	s.dispatch(prime1)
++	require.Same(t, prime0, <-st0.ch)
++	require.Same(t, prime1, <-st1.ch)
++
++	require.NoError(t, st0.Close())
++	pkt0 := &Packet{CodecID: 0xFFFF, FlagsChannel: 0}
++	pkt1 := &Packet{CodecID: 0xFFFF, FlagsChannel: 1}
++	s.dispatch(pkt0)
++	s.dispatch(pkt1)
++
++	select {
++	case got := <-st1.ch:
++		require.Same(t, pkt1, got)
++	default:
++		t.Fatal("expected remaining channel stream to receive its own packet")
++	}
++
++	select {
++	case got := <-st1.ch:
++		t.Fatalf("unexpected extra packet: %#v", got)
++	default:
++	}
++
++	st1.close()
++}
++
++func TestSessionDispatchKeepsSingleStreamBeforeClassifierIsReady(t *testing.T) {
++	s := newSession(newFakeClient(), "key", nil)
++
++	s.mu.Lock()
++	st0, err := s.openStreamLocked(0, audioVideoStart)
++	require.NoError(t, err)
++	st1, err := s.openStreamLocked(1, audioVideoStart)
++	require.NoError(t, err)
++	s.startedMask = 0b11
++	s.mu.Unlock()
++
++	require.NoError(t, st0.Close())
++	pkt1 := &Packet{CodecID: 0xFFFF, FlagsChannel: 1}
++	s.dispatch(pkt1)
++
++	select {
++	case got := <-st1.ch:
++		require.Same(t, pkt1, got)
++	default:
++		t.Fatal("expected remaining channel stream to receive packet before classifier is ready")
++	}
++
++	st1.close()
++}
++
++func TestSessionStartMediaDualFailureDoesNotMarkSecondChannelStarted(t *testing.T) {
++	client := newFakeClient()
++	client.startMediaDualErr = errors.New("dual failed")
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		return client, nil
++	})
++
++	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(0, "hd", "1"))
++	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	require.NoError(t, err)
++	require.Error(t, s.startMedia(1, "sd", "1"))
++	require.Equal(t, uint8(0b01), s.startedMask)
++
++	require.NoError(t, st1.Close())
++	require.NoError(t, st0.Close())
++	waitWorker(t, s)
++}
++
++func TestSessionManagerRedialsAfterReadError(t *testing.T) {
++	var clients []*fakeClient
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		client := newFakeClient()
++		clients = append(clients, client)
++		return client, nil
++	})
++
++	s1, _, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	clients[0].readErr <- errors.New("read failed")
++	waitWorker(t, s1)
++
++	s2, st2, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	require.NotSame(t, s1, s2)
++	require.Len(t, clients, 2)
++
++	require.NoError(t, st2.Close())
++	waitWorker(t, s2)
++}
++
++func TestSessionManagerRedialsAfterLastStreamClose(t *testing.T) {
++	var clients []*fakeClient
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		client := newFakeClient()
++		clients = append(clients, client)
++		return client, nil
++	})
++
++	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	require.NoError(t, st1.Close())
++	waitWorker(t, s1)
++
++	s2, st2, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, err)
++	require.NotSame(t, s1, s2)
++	require.Len(t, clients, 2)
++
++	require.NoError(t, st2.Close())
++	waitWorker(t, s2)
++}
++
++func TestSessionManagerConcurrentAcquireClosesDuplicateClient(t *testing.T) {
++	created := make(chan *fakeClient, 2)
++	release := make(chan struct{})
++	manager := newSessionManager(func(string) (sessionClient, error) {
++		client := newFakeClient()
++		created <- client
++		<-release
++		return client, nil
++	})
++
++	type result struct {
++		session *session
++		stream  *stream
++		err     error
++	}
++	results := make(chan result, 2)
++	for range 2 {
++		go func() {
++			s, st, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++			results <- result{session: s, stream: st, err: err}
++		}()
++	}
++
++	var clients []*fakeClient
++	for range 2 {
++		select {
++		case client := <-created:
++			clients = append(clients, client)
++		case <-time.After(time.Second):
++			t.Fatal("timed out waiting for duplicate dials")
++		}
++	}
++	close(release)
++
++	var got []result
++	for range 2 {
++		select {
++		case res := <-results:
++			require.NoError(t, res.err)
++			got = append(got, res)
++		case <-time.After(time.Second):
++			t.Fatal("timed out waiting for acquire results")
++		}
++	}
++
++	require.Same(t, got[0].session, got[1].session)
++	closeCounts := 0
++	for _, client := range clients {
++		_, closeCount, _, _ := client.counts()
++		closeCounts += closeCount
++	}
++	require.Equal(t, 1, closeCounts)
++
++	require.NoError(t, got[0].stream.Close())
++	require.NoError(t, got[1].stream.Close())
++	waitWorker(t, got[0].session)
++}
++
++func TestParseChannel(t *testing.T) {
++	query := url.Values{}
++	channel, err := parseChannel(query)
++	require.NoError(t, err)
++	require.Equal(t, uint8(0), channel)
++
++	query.Set("channel", "0")
++	channel, err = parseChannel(query)
++	require.NoError(t, err)
++	require.Equal(t, uint8(0), channel)
++
++	query.Set("channel", "1")
++	channel, err = parseChannel(query)
++	require.NoError(t, err)
++	require.Equal(t, uint8(1), channel)
++
++	query.Set("channel", "2")
++	_, err = parseChannel(query)
++	require.Error(t, err)
++}
++
++func TestDialRejectsMalformedURL(t *testing.T) {
++	_, err := Dial("xiaomi://%zz")
++	require.Error(t, err)
++}
++
++func waitWorker(t *testing.T, s *session) {
++	t.Helper()
++
++	select {
++	case <-s.workerDone:
++	case <-time.After(2 * time.Second):
++		t.Fatal("timed out waiting for worker")
++	}
++}

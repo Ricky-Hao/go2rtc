@@ -1,0 +1,19 @@
+{
+  "checks": [
+    {
+      "name": "MISS receive-only audio and backchannel parsing",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        "go.mod",
+        "pkg/xiaomi/miss/producer_test.go"
+      ],
+      "runner": "go",
+      "package": "./pkg/xiaomi/miss",
+      "tests": [
+        "TestProbeDisablesBackchannelButKeepsReceiveAudio",
+        "TestParseBackchannel"
+      ]
+    }
+  ]
+}

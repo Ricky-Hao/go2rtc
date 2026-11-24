@@ -1,0 +1,15 @@
+diff --git a/AGENTS.md b/AGENTS.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..72cc4200c0a2a0e908381f9f7e0ea01fe35fb36e
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,9 @@
++# go2rtc application development
++
++This checkout contains go2rtc at the patch manifest's upstream base with the selected payloads staged. Maintain the payloads in the patch repository. Keep upstream code conventions and use the existing lock data in `go.mod` and `go.sum`.
++
++- Read the [go2rtc README](README.md) and the relevant package documentation before changing a module. The Xiaomi source options are in its [README](internal/xiaomi/README.md).
++- Use Go 1.25, format changed Go files with `gofmt`, and run the owning package tests with `go test -mod=readonly -count=1`. For Xiaomi/MISS, use `./internal/xiaomi ./pkg/xiaomi/miss` when both sets of tests are present. Verify that targeted tests are discovered and run.
++- Build the application with `CGO_ENABLED=0 go build -mod=readonly -ldflags "-s -w" -trimpath .`. Keep runtime configuration, tokens and captures local. Camera, cloud and network discovery tests require approval for the actual target.
++- Record the generated index tree before editing. Stage the intended changes, regenerate the owning patch from its correct predecessor, and verify it from a fresh checkout at the pinned base. See the patch repository's maintenance guide for the exact commands.
++- Use this checkout for application development and build verification. The patch repository owns active CI. Keep any remote publication or deployment within its separately agreed scope.

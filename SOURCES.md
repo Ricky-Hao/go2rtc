@@ -1,0 +1,5 @@
+# Sources and licenses
+
+The application starts at `dc1685e9cf7a8c349181f20a1b4a44825ed394c5` from `AlexxIT/go2rtc`. The initial payloads reconstruct the tracked files from the original fork snapshot `48ff711437d05852d9e1cce1aa788ed2330c2fc5`. The upstream and fork material uses the go2rtc MIT [license](LICENSE). Commit provenance for each delta is in the [extraction record](docs/extraction.md) and group guides. [Official base](https://github.com/AlexxIT/go2rtc/commit/dc1685e9cf7a8c349181f20a1b4a44825ed394c5) · [Fork snapshot](https://github.com/Ricky-Hao/go2rtc/commit/48ff711437d05852d9e1cce1aa788ed2330c2fc5)
+
+The maintenance layout, manifest structure, CI replay and devcontainer conventions follow `Ricky-Hao/LibreChat` patches at `fff88e3c323a5d11b0e1e3e9a9ec8ef2abb88e44`. The Python CLI and its unit tests adapt LibreChat's standard-library and Git implementation. The reference's MIT notice is included in [tools/LICENSE](tools/LICENSE). [Reference checkout](https://github.com/Ricky-Hao/LibreChat/tree/fff88e3c323a5d11b0e1e3e9a9ec8ef2abb88e44) · [Reference tools](https://github.com/Ricky-Hao/LibreChat/tree/fff88e3c323a5d11b0e1e3e9a9ec8ef2abb88e44/tools)

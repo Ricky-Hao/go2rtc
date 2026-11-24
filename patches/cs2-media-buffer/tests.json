@@ -1,0 +1,20 @@
+{
+  "checks": [
+    {
+      "name": "Build CS2 transport",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        "go.mod",
+        "pkg/xiaomi/miss/cs2/conn.go"
+      ],
+      "runner": "command",
+      "command": [
+        "go",
+        "build",
+        "-mod=readonly",
+        "./pkg/xiaomi/miss/cs2"
+      ]
+    }
+  ]
+}

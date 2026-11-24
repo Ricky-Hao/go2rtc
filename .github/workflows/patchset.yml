@@ -1,0 +1,137 @@
+name: Test patches and build binaries
+
+on:
+  pull_request:
+    branches: [patches]
+  push:
+    branches: [patches]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.25.14'
+  GOTOOLCHAIN: local
+  CGO_ENABLED: '0'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      base: ${{ steps.manifest.outputs.base }}
+      tree: ${{ steps.replay.outputs.tree }}
+    steps:
+      - name: Check out the patch revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate the patch tools and read the base
+        id: manifest
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -m unittest discover -s tools
+          base=$(python3 -c 'from tools.patchset import load_manifest; print(load_manifest()["base"])')
+          printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the official base
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: AlexxIT/go2rtc
+          ref: ${{ steps.manifest.outputs.base }}
+          fetch-depth: 0
+          path: .work/application
+          persist-credentials: false
+
+      - name: Check and apply the manifest
+        id: replay
+        run: |
+          python3 tools/patchset.py check --target .work/application
+          groups=$(python3 -c 'from tools.patchset import load_manifest; print(*(p["id"] for p in load_manifest()["patches"]))')
+          for group in $groups; do
+            python3 tools/patchset.py check --target .work/application --only "$group"
+          done
+          python3 tools/patchset.py apply --target .work/application
+          git -C .work/application diff --exit-code
+          git -C .work/application diff --cached --check
+          tree=$(git -C .work/application write-tree)
+          printf 'tree=%s\n' "$tree" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Run patch and project tests
+        run: python3 tools/patchset.py test --target .work/application --tier all
+
+  build:
+    name: Build ${{ matrix.artifact }}
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {artifact: go2rtc_win64, goos: windows, goarch: amd64, filename: go2rtc.exe}
+          - {artifact: go2rtc_win32, goos: windows, goarch: '386', filename: go2rtc.exe}
+          - {artifact: go2rtc_win_arm64, goos: windows, goarch: arm64, filename: go2rtc.exe}
+          - {artifact: go2rtc_linux_amd64, goos: linux, goarch: amd64, filename: go2rtc}
+          - {artifact: go2rtc_linux_i386, goos: linux, goarch: '386', filename: go2rtc}
+          - {artifact: go2rtc_linux_arm64, goos: linux, goarch: arm64, filename: go2rtc}
+          - {artifact: go2rtc_linux_arm, goos: linux, goarch: arm, goarm: '7', filename: go2rtc}
+          - {artifact: go2rtc_linux_armv6, goos: linux, goarch: arm, goarm: '6', filename: go2rtc}
+          - {artifact: go2rtc_linux_mipsel, goos: linux, goarch: mipsle, filename: go2rtc}
+          - {artifact: go2rtc_mac_amd64, goos: darwin, goarch: amd64, filename: go2rtc}
+          - {artifact: go2rtc_mac_arm64, goos: darwin, goarch: arm64, filename: go2rtc}
+          - {artifact: go2rtc_freebsd_amd64, goos: freebsd, goarch: amd64, filename: go2rtc}
+          - {artifact: go2rtc_freebsd_arm64, goos: freebsd, goarch: arm64, filename: go2rtc}
+    steps:
+      - name: Check out the patch revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out the official base
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: AlexxIT/go2rtc
+          ref: ${{ needs.validate.outputs.base }}
+          fetch-depth: 0
+          path: .work/application
+          persist-credentials: false
+
+      - name: Reproduce the validated tree
+        env:
+          VALIDATED_TREE: ${{ needs.validate.outputs.tree }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 tools/patchset.py apply --target .work/application
+          test "$(git -C .work/application write-tree)" = "$VALIDATED_TREE"
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Build the binary
+        working-directory: .work/application
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          OUTPUT: ${{ matrix.filename }}
+        run: go build -mod=readonly -ldflags "-s -w" -trimpath -o "$OUTPUT" .
+
+      - name: Upload binary to the workflow run
+        if: >-
+          github.repository == 'Ricky-Hao/go2rtc' && github.ref == 'refs/heads/patches' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: .work/application/${{ matrix.filename }}
+          if-no-files-found: error

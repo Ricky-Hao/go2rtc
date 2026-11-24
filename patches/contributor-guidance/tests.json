@@ -1,0 +1,21 @@
+{
+  "checks": [
+    {
+      "name": "Application contributor guide whitespace",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        "AGENTS.md"
+      ],
+      "runner": "command",
+      "command": [
+        "git",
+        "diff",
+        "--check",
+        "HEAD",
+        "--",
+        "AGENTS.md"
+      ]
+    }
+  ]
+}

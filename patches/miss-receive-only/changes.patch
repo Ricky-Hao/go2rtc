@@ -1,0 +1,176 @@
+diff --git a/internal/xiaomi/README.md b/internal/xiaomi/README.md
+index 334d9d15088b0eaf92ca2a17179d94e442b0a930..987cbb340f96703424d753ee34512ffff6e6125c 100644
+--- a/internal/xiaomi/README.md
++++ b/internal/xiaomi/README.md
+@@ -62,3 +62,13 @@ You can use a second channel for dual cameras: `channel=1`.
+ streams:
+   xiaomi1: xiaomi://***&channel=1
+ ```
++
++You can keep camera audio while disabling two-way audio with
++`#backchannel=0`. Add it to every source for the same camera. The option takes
++effect after the existing MISS session reconnects and prevents go2rtc from
++starting the camera speaker.
++
++```yaml
++streams:
++  xiaomi1: xiaomi://***#backchannel=0
++```
+diff --git a/pkg/xiaomi/miss/producer.go b/pkg/xiaomi/miss/producer.go
+index abbef81b31ac90fc55602096198189297cba7784..c30762e2762ec38f6241fb37b4c06e3a32244f5b 100644
+--- a/pkg/xiaomi/miss/producer.go
++++ b/pkg/xiaomi/miss/producer.go
+@@ -4,6 +4,7 @@ import (
+ 	"fmt"
+ 	"net/url"
+ 	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
+@@ -29,6 +30,10 @@ func Dial(rawURL string) (core.Producer, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	backchannel, err := parseBackchannel(u.Fragment)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	audio := parseAudioMode(query.Get("audio"))
+ 	sess, st, err := defaultSessionManager.acquire(rawURL, channel, audio)
+@@ -42,7 +47,7 @@ func Dial(rawURL string) (core.Producer, error) {
+ 		return nil, err
+ 	}
+ 
+-	medias, err := probe(st, audio.enabled())
++	medias, err := probe(st, audio.enabled(), backchannel)
+ 	if err != nil {
+ 		_ = st.Close()
+ 		return nil, err
+@@ -62,6 +67,18 @@ func Dial(rawURL string) (core.Producer, error) {
+ 	}, nil
+ }
+ 
++func parseBackchannel(fragment string) (bool, error) {
++	if fragment == "" {
++		return true, nil
++	}
++
++	query, err := url.ParseQuery(strings.ReplaceAll(fragment, "#", "&"))
++	if err != nil {
++		return false, fmt.Errorf("xiaomi: invalid source options: %w", err)
++	}
++	return query.Get("backchannel") != "0", nil
++}
++
+ func parseChannel(query url.Values) (uint8, error) {
+ 	raw := query.Get("channel")
+ 	switch raw {
+@@ -73,7 +90,7 @@ func parseChannel(query url.Values) (uint8, error) {
+ 	return 0, fmt.Errorf("xiaomi: unsupported channel: %s", strconv.Quote(raw))
+ }
+ 
+-func probe(st *stream, audio bool) ([]*core.Media, error) {
++func probe(st *stream, audio, backchannel bool) ([]*core.Media, error) {
+ 	_ = st.SetDeadline(time.Now().Add(15 * time.Second))
+ 
+ 	var vcodec, acodec *core.Codec
+@@ -127,7 +144,9 @@ func probe(st *stream, audio bool) ([]*core.Media, error) {
+ 				acodec = st.session.defaultAudioCodec()
+ 			}
+ 		}
+-		talkCodec = st.session.talkCodec()
++		if backchannel {
++			talkCodec = st.session.talkCodec()
++		}
+ 	}
+ 
+ 	medias := []*core.Media{
+diff --git a/pkg/xiaomi/miss/producer_test.go b/pkg/xiaomi/miss/producer_test.go
+index 485983ed98316f2a66442cd2fd512d73b0bacca7..511a45b0d7af09f5cf3056a6713996caed3d3c0b 100644
+--- a/pkg/xiaomi/miss/producer_test.go
++++ b/pkg/xiaomi/miss/producer_test.go
+@@ -16,7 +16,7 @@ func TestProbeAddsDefaultSharedAudioMedia(t *testing.T) {
+ 	st := newTestStream(s)
+ 	st.ch <- testH264Packet(t)
+ 
+-	medias, err := probe(st, true)
++	medias, err := probe(st, true, true)
+ 	require.NoError(t, err)
+ 	require.Len(t, medias, 3)
+ 	require.Equal(t, core.KindVideo, medias[0].Kind)
+@@ -35,19 +35,53 @@ func TestProbeUsesPCMARecvDefaultForOpusTalk(t *testing.T) {
+ 	st := newTestStream(s)
+ 	st.ch <- testH264Packet(t)
+ 
+-	medias, err := probe(st, true)
++	medias, err := probe(st, true, true)
+ 	require.NoError(t, err)
+ 	require.Len(t, medias, 3)
+ 	require.Equal(t, core.CodecPCMA, medias[1].Codecs[0].Name)
+ 	require.Equal(t, core.CodecOpus, medias[2].Codecs[0].Name)
+ }
+ 
++func TestProbeDisablesBackchannelButKeepsReceiveAudio(t *testing.T) {
++	s := newSession(newFakeClient(), "key", nil)
++	st := newTestStream(s)
++	st.ch <- testH264Packet(t)
++
++	medias, err := probe(st, true, false)
++	require.NoError(t, err)
++	require.Len(t, medias, 2)
++	require.Equal(t, core.KindVideo, medias[0].Kind)
++	require.Equal(t, core.KindAudio, medias[1].Kind)
++	require.Equal(t, core.DirectionRecvonly, medias[1].Direction)
++}
++
++func TestParseBackchannel(t *testing.T) {
++	for _, fragment := range []string{"", "backchannel=1", "backchannel=true", "other=1"} {
++		enabled, err := parseBackchannel(fragment)
++		require.NoError(t, err)
++		require.True(t, enabled)
++	}
++
++	enabled, err := parseBackchannel("backchannel=0")
++	require.NoError(t, err)
++	require.False(t, enabled)
++
++	for _, fragment := range []string{"backchannel=0#other=1", "other=1#backchannel=0"} {
++		enabled, err = parseBackchannel(fragment)
++		require.NoError(t, err)
++		require.False(t, enabled)
++	}
++
++	_, err = parseBackchannel("backchannel=%")
++	require.Error(t, err)
++}
++
+ func TestProbeDoesNotAddSharedAudioMediaWhenDisabled(t *testing.T) {
+ 	s := newSession(newFakeClient(), "key", nil)
+ 	st := newTestStream(s)
+ 	st.ch <- testH264Packet(t)
+ 
+-	medias, err := probe(st, false)
++	medias, err := probe(st, false, true)
+ 	require.NoError(t, err)
+ 	require.Len(t, medias, 1)
+ 	require.Equal(t, core.KindVideo, medias[0].Kind)
+@@ -63,7 +97,7 @@ func TestProbeReusesObservedSharedAudioCodec(t *testing.T) {
+ 	}
+ 	st0.ch <- testH264Packet(t)
+ 
+-	medias0, err := probe(st0, true)
++	medias0, err := probe(st0, true, true)
+ 	require.NoError(t, err)
+ 	require.Len(t, medias0, 3)
+ 	require.Equal(t, core.CodecPCMU, medias0[1].Codecs[0].Name)
+@@ -73,7 +107,7 @@ func TestProbeReusesObservedSharedAudioCodec(t *testing.T) {
+ 	st1 := newTestStream(s)
+ 	st1.ch <- testH264Packet(t)
+ 
+-	medias1, err := probe(st1, true)
++	medias1, err := probe(st1, true, true)
+ 	require.NoError(t, err)
+ 	require.Len(t, medias1, 3)
+ 	require.Equal(t, core.CodecPCMU, medias1[1].Codecs[0].Name)

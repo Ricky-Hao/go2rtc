@@ -1,0 +1,98 @@
+{
+  "format": 1,
+  "base": "dc1685e9cf7a8c349181f20a1b4a44825ed394c5",
+  "patches": [
+    {
+      "id": "cs2-media-buffer",
+      "status": "keep",
+      "depends_on": [],
+      "patch": "patches/cs2-media-buffer/changes.patch",
+      "paths": [
+        "pkg/xiaomi/miss/cs2/conn.go"
+      ],
+      "tests": "patches/cs2-media-buffer/tests.json"
+    },
+    {
+      "id": "miss-shared-session",
+      "status": "feature",
+      "depends_on": [],
+      "patch": "patches/miss-shared-session/changes.patch",
+      "paths": [
+        "internal/xiaomi/MISS_REFACTOR_IMPLEMENTATION_PLAN.md",
+        "internal/xiaomi/README.md",
+        "internal/xiaomi/miss_cred_cache.go",
+        "internal/xiaomi/miss_cred_cache_test.go",
+        "internal/xiaomi/xiaomi.go",
+        "pkg/xiaomi/miss/backchannel.go",
+        "pkg/xiaomi/miss/classifier.go",
+        "pkg/xiaomi/miss/classifier_test.go",
+        "pkg/xiaomi/miss/client.go",
+        "pkg/xiaomi/miss/producer.go",
+        "pkg/xiaomi/miss/producer_test.go",
+        "pkg/xiaomi/miss/session.go",
+        "pkg/xiaomi/miss/session_manager.go",
+        "pkg/xiaomi/miss/session_manager_test.go"
+      ],
+      "tests": "patches/miss-shared-session/tests.json"
+    },
+    {
+      "id": "miss-channel-reconnect",
+      "status": "keep",
+      "depends_on": [
+        "miss-shared-session"
+      ],
+      "patch": "patches/miss-channel-reconnect/changes.patch",
+      "paths": [
+        "pkg/xiaomi/miss/session.go",
+        "pkg/xiaomi/miss/session_manager_test.go"
+      ],
+      "tests": "patches/miss-channel-reconnect/tests.json"
+    },
+    {
+      "id": "xiaomi-cloud-auth",
+      "status": "keep",
+      "depends_on": [],
+      "patch": "patches/xiaomi-cloud-auth/changes.patch",
+      "paths": [
+        "internal/xiaomi/cloud_auth_test.go",
+        "internal/xiaomi/xiaomi.go",
+        "pkg/xiaomi/cloud.go"
+      ],
+      "tests": "patches/xiaomi-cloud-auth/tests.json"
+    },
+    {
+      "id": "miss-receive-only",
+      "status": "feature",
+      "depends_on": [
+        "miss-shared-session"
+      ],
+      "patch": "patches/miss-receive-only/changes.patch",
+      "paths": [
+        "internal/xiaomi/README.md",
+        "pkg/xiaomi/miss/producer.go",
+        "pkg/xiaomi/miss/producer_test.go"
+      ],
+      "tests": "patches/miss-receive-only/tests.json"
+    },
+    {
+      "id": "legacy-workflow",
+      "status": "local",
+      "depends_on": [],
+      "patch": "patches/legacy-workflow/changes.patch",
+      "paths": [
+        ".github/workflows/build.yml"
+      ],
+      "tests": "patches/legacy-workflow/tests.json"
+    },
+    {
+      "id": "contributor-guidance",
+      "status": "local",
+      "depends_on": [],
+      "patch": "patches/contributor-guidance/changes.patch",
+      "paths": [
+        "AGENTS.md"
+      ],
+      "tests": "patches/contributor-guidance/tests.json"
+    }
+  ]
+}

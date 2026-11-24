@@ -1,0 +1,28 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 6015efa020d00215ee7adc0475e6dc6815475faf..4cdb92b746db1d5d773f29b3a389e070de899c75 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -114,6 +114,7 @@ jobs:
+ 
+   docker-master:
+     name: Build docker master
++    if: ${{ false }}
+     runs-on: ubuntu-latest
+     steps:
+       - name: Checkout
+@@ -171,6 +172,7 @@ jobs:
+ 
+   docker-hardware:
+     name: Build docker hardware
++    if: ${{ false }}
+     runs-on: ubuntu-latest
+     steps:
+       - name: Checkout
+@@ -226,6 +228,7 @@ jobs:
+ 
+   docker-rockchip:
+     name: Build docker rockchip
++    if: ${{ false }}
+     runs-on: ubuntu-latest
+     steps:
+       - name: Checkout

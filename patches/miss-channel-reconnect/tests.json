@@ -1,0 +1,19 @@
+{
+  "checks": [
+    {
+      "name": "Restart a dropped MISS channel with or without a peer",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        "go.mod",
+        "pkg/xiaomi/miss/session_manager_test.go"
+      ],
+      "runner": "go",
+      "package": "./pkg/xiaomi/miss",
+      "tests": [
+        "TestSessionRestartDroppedChannelReissuesDualStart",
+        "TestSessionRestartDroppedChannelFallsBackToSingleWhenPeerGone"
+      ]
+    }
+  ]
+}

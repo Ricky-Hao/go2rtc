@@ -1,0 +1,18 @@
+{
+  "checks": [
+    {
+      "name": "Legacy Docker jobs remain disabled",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        ".github/workflows/build.yml"
+      ],
+      "runner": "command",
+      "command": [
+        "python3",
+        "-c",
+        "from pathlib import Path\nlines = Path('.github/workflows/build.yml').read_text().splitlines()\nfor job in ('docker-master', 'docker-hardware', 'docker-rockchip'):\n    header = lines.index(f'  {job}:')\n    if lines[header + 2] != '    if: ${{ false }}':\n        raise SystemExit(f'{job} must remain disabled in the legacy workflow')"
+      ]
+    }
+  ]
+}

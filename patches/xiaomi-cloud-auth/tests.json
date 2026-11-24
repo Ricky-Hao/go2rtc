@@ -1,0 +1,22 @@
+{
+  "checks": [
+    {
+      "name": "Xiaomi cloud authentication refresh",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        "go.mod",
+        "internal/xiaomi/cloud_auth_test.go"
+      ],
+      "runner": "go",
+      "package": "./internal/xiaomi",
+      "tests": [
+        "TestCloudRequestRefreshesCloudOnUnauthorized",
+        "TestCloudRequestUsesAlreadyRefreshedCloud",
+        "TestCloudRequestDoesNotRefreshOnNonUnauthorizedError",
+        "TestCloudRequestRetriesOnlyOnceOnUnauthorized",
+        "TestSetUserTokenClearsCachedCloud"
+      ]
+    }
+  ]
+}

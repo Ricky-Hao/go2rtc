@@ -1,0 +1,13 @@
+{
+  "name": "go2rtc patch maintenance",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "vscode",
+  "customizations": {
+    "vscode": {
+      "extensions": ["golang.Go"]
+    }
+  }
+}

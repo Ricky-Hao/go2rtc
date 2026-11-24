@@ -1,0 +1,7 @@
+# Patch checkout instructions
+
+- Read [README](README.md) for the local checkout commands, [maintenance](docs/maintenance.md) for replay and updates, and [status](docs/status.md) for the current baseline. Check [extraction](docs/extraction.md) when changing a migrated group or comparing with `master`.
+- Maintain `manifest.json`, the group payloads, their checks and guides, and the patch checkout tooling and environment here. Generate and edit Go code in a separate Git checkout following its `AGENTS.md`. Keep the generated tree and build outputs under `.work/` or outside the patch checkout.
+- Use the exact official upstream commit from the manifest. Record prerequisites in `depends_on`, list each payload's affected paths and keep the array in application order. Generate contextual Git diffs from the staged application changes. Carry over any affected tests and user documentation.
+- For a patch change, check its dependency closure and replay the full manifest in clean base checkouts. Run the actual affected checks and check whitespace in both checkouts. For tooling changes, run `python3 -m unittest discover -s tools`. Report execution failures and skipped coverage with the commands used.
+- Keep history on `master` available for comparison. Repository settings, remote writes, CI dispatch, releases, deployment, device tests and Coder rebuilds require task-specific authorization. Keep application credentials out of source, patches, tests and logs.

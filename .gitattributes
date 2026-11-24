@@ -1,0 +1,6 @@
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+# Preserve nested Git diff bytes. Check source whitespace in the generated checkout.
+*.patch -text -whitespace

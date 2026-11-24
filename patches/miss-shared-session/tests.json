@@ -1,0 +1,97 @@
+{
+  "checks": [
+    {
+      "name": "MISS credential cache",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        "go.mod",
+        "internal/xiaomi/miss_cred_cache_test.go"
+      ],
+      "runner": "go",
+      "package": "./internal/xiaomi",
+      "tests": [
+        "TestMissCredCache",
+        "TestMissCredCacheKeySeparatesCredentials",
+        "TestGetMissURLUsesCachedCredentials",
+        "TestGetMissURLDoesNotSetEmptyCachedUID"
+      ]
+    },
+    {
+      "name": "MISS classifier, producer audio and session lifecycle",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": [
+        "go.mod",
+        "pkg/xiaomi/miss/classifier_test.go",
+        "pkg/xiaomi/miss/producer_test.go",
+        "pkg/xiaomi/miss/session_manager_test.go"
+      ],
+      "runner": "go",
+      "package": "./pkg/xiaomi/miss",
+      "tests": [
+        "TestPacketClassifierHeaderChannelNeedsBothValues",
+        "TestPacketClassifierFlagsChannelNeedsBothValues",
+        "TestPacketClassifierAssignResolution",
+        "TestPacketClassifierTimestampTieBreaksToChannelZero",
+        "TestPacketClassifierTimestampIgnoresBackwardsTimestamp",
+        "TestProbeAddsDefaultSharedAudioMedia",
+        "TestProbeUsesPCMARecvDefaultForOpusTalk",
+        "TestProbeDoesNotAddSharedAudioMediaWhenDisabled",
+        "TestProbeReusesObservedSharedAudioCodec",
+        "TestProducerStartHandlesSharedAudioCodecs",
+        "TestProducerStartTranscodesSharedPCMToDefaultAudioReceiver",
+        "TestProducerStartResamplesSameSharedAudioCodec",
+        "TestBackchannelCodecUsesNegotiatedCodecForAnyTrack",
+        "TestBackchannelCodecRejectsUnresolvedAnyTrack",
+        "TestSessionManagerAcquireReusesActiveSession",
+        "TestSessionManagerDoesNotShareDafangLikeSession",
+        "TestSessionReadErrorShutdownSkipsStopMedia",
+        "TestSessionNoStreamsShutdownStopsMedia",
+        "TestSessionStartMediaDualUpgrade",
+        "TestSessionStartMediaDualKeepsSharedAudioEnabled",
+        "TestSessionStartMediaEnablesAudioForAlreadyStartedChannel",
+        "TestSessionStartMediaStartsAudioCommandForExplicitAudio2",
+        "TestSessionStartMediaIgnoresAudioStartCommandError",
+        "TestSessionStartMediaDoesNotStartSharedAudioWhenDisabled",
+        "TestSessionDispatchClassifiesAfterDualStreamCloses",
+        "TestSessionDispatchKeepsSingleStreamBeforeClassifierIsReady",
+        "TestSessionStartMediaDualFailureDoesNotMarkSecondChannelStarted",
+        "TestSessionManagerRedialsAfterReadError",
+        "TestSessionManagerRedialsAfterLastStreamClose",
+        "TestSessionManagerConcurrentAcquireClosesDuplicateClient",
+        "TestParseChannel",
+        "TestDialRejectsMalformedURL"
+      ]
+    },
+    {
+      "name": "Local media and streaming package tests",
+      "tier": "project",
+      "cwd": ".",
+      "requires": [
+        "go.mod",
+        "internal/ffmpeg/virtual/virtual_test.go",
+        "internal/webrtc/webrtc_test.go",
+        "pkg/h264/h264_test.go",
+        "pkg/h265/h265_test.go",
+        "pkg/pcm/pcm_test.go",
+        "pkg/rtsp/client_test.go",
+        "pkg/webrtc/client_test.go"
+      ],
+      "runner": "command",
+      "command": [
+        "go",
+        "test",
+        "-mod=readonly",
+        "-count=1",
+        "./internal/ffmpeg/virtual",
+        "./internal/webrtc",
+        "./pkg/h264/...",
+        "./pkg/h265",
+        "./pkg/pcm/...",
+        "./pkg/rtsp",
+        "./pkg/webrtc"
+      ]
+    }
+  ]
+}
