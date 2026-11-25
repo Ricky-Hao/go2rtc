@@ -37,7 +37,7 @@ An existing fallback workspace can use a Go 1.27.4 archive for its OS and archit
 
 ## Maintenance
 
-The patch workflow validates pushes to `patches` and PRs targeting it. It tests and builds a separate generated application checkout inside Actions. On a push to the fork's `patches` branch, it uploads binaries for the existing 13 targets as Actions run artifacts. [Patch workflow](.github/workflows/patchset.yml)
+The patch workflow tests the generated application and builds `go2rtc_linux_arm64` for pushes to `patches` or `patches-*` tags, PRs targeting `patches`, and manual runs. In `Ricky-Hao/go2rtc`, `patches` branch pushes and manual runs on that branch provide the binary as an Actions artifact. Matching tag pushes also provide the artifact and publish it as the sole binary asset in a GitHub Release after validation. [Patch workflow](.github/workflows/patchset.yml)
 
 See how to develop in the generated application, write changes back to a group, update the base and review CI results. [Maintenance guide](docs/maintenance.md)
 

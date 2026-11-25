@@ -5,6 +5,7 @@ on:
     branches: [patches]
   push:
     branches: [patches]
+    tags: ['patches-*']
   workflow_dispatch:
 
 permissions:
@@ -68,26 +69,11 @@ jobs:
         run: python3 tools/patchset.py test --target .work/application --tier all
 
   build:
-    name: Build ${{ matrix.artifact }}
+    name: Build go2rtc_linux_arm64
     needs: validate
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {artifact: go2rtc_win64, goos: windows, goarch: amd64, filename: go2rtc.exe}
-          - {artifact: go2rtc_win32, goos: windows, goarch: '386', filename: go2rtc.exe}
-          - {artifact: go2rtc_win_arm64, goos: windows, goarch: arm64, filename: go2rtc.exe}
-          - {artifact: go2rtc_linux_amd64, goos: linux, goarch: amd64, filename: go2rtc}
-          - {artifact: go2rtc_linux_i386, goos: linux, goarch: '386', filename: go2rtc}
-          - {artifact: go2rtc_linux_arm64, goos: linux, goarch: arm64, filename: go2rtc}
-          - {artifact: go2rtc_linux_arm, goos: linux, goarch: arm, goarm: '7', filename: go2rtc}
-          - {artifact: go2rtc_linux_armv6, goos: linux, goarch: arm, goarm: '6', filename: go2rtc}
-          - {artifact: go2rtc_linux_mipsel, goos: linux, goarch: mipsle, filename: go2rtc}
-          - {artifact: go2rtc_mac_amd64, goos: darwin, goarch: amd64, filename: go2rtc}
-          - {artifact: go2rtc_mac_arm64, goos: darwin, goarch: arm64, filename: go2rtc}
-          - {artifact: go2rtc_freebsd_amd64, goos: freebsd, goarch: amd64, filename: go2rtc}
-          - {artifact: go2rtc_freebsd_arm64, goos: freebsd, goarch: arm64, filename: go2rtc}
+    outputs:
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
     steps:
       - name: Check out the patch revision
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -120,18 +106,88 @@ jobs:
       - name: Build the binary
         working-directory: .work/application
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
-          OUTPUT: ${{ matrix.filename }}
-        run: go build -mod=readonly -ldflags "-s -w" -trimpath -o "$OUTPUT" .
+          GOOS: linux
+          GOARCH: arm64
+          GOARM64: v8.0
+        run: go build -mod=readonly -ldflags "-s -w" -trimpath -o go2rtc_linux_arm64 .
 
       - name: Upload binary to the workflow run
+        id: artifact
         if: >-
-          github.repository == 'Ricky-Hao/go2rtc' && github.ref == 'refs/heads/patches' &&
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          github.repository == 'Ricky-Hao/go2rtc' &&
+          ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/patches') ||
+          (github.event_name == 'push' && github.event.deleted == false &&
+          (github.ref == 'refs/heads/patches' || startsWith(github.ref, 'refs/tags/patches-'))))
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ${{ matrix.artifact }}
-          path: .work/application/${{ matrix.filename }}
+          name: go2rtc_linux_arm64
+          path: .work/application/go2rtc_linux_arm64
           if-no-files-found: error
+          overwrite: true
+
+  release:
+    name: Publish Linux ARM64 release
+    needs: build
+    if: >-
+      github.repository == 'Ricky-Hao/go2rtc' && github.event_name == 'push' &&
+      github.event.deleted == false && startsWith(github.ref, 'refs/tags/patches-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: patchset-release-${{ github.ref }}
+    steps:
+      - name: Download the validated binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          releases_for_tag() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases" |
+              jq -s --arg tag "$GITHUB_REF_NAME" '[.[][] | select(.tag_name == $tag)]'
+          }
+
+          releases=$(releases_for_tag)
+          if jq -e 'any(.[]; .draft == false)' <<< "$releases" > /dev/null; then
+            printf 'Release %s is already published.\n' "$GITHUB_REF_NAME"
+            exit 0
+          fi
+          if jq -e 'length > 0' <<< "$releases" > /dev/null; then
+            printf 'Draft already exists for %s. See docs/maintenance.md for recovery.\n' "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          ref=$(jq -rn --arg ref "$GITHUB_REF" '$ref | @uri')
+          verify_tag() {
+            local sha
+            sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$ref" --jq .sha)
+            if [[ "$sha" != "$GITHUB_SHA" ]]; then
+              printf 'Expected %s at %s, found %s.\n' "$GITHUB_REF" "$GITHUB_SHA" "$sha" >&2
+              return 1
+            fi
+          }
+
+          asset=dist/go2rtc_linux_arm64
+          test -s "$asset"
+          notes="NAS Linux ARM64 build from $GITHUB_SHA. [Actions run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+          verify_tag
+          gh release create "$GITHUB_REF_NAME" "$asset" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --draft --title "$GITHUB_REF_NAME" --notes "$notes"
+
+          # Publish by ID to address only the draft just created by this run.
+          release_id=$(releases_for_tag | jq -er --arg notes "$notes" --arg asset "${asset##*/}" '
+            if length == 1 and (.[0] | .draft and .body == $notes and
+              (.assets | map({name, state})) == [{name: $asset, state: "uploaded"}])
+            then .[0].id
+            else error("Expected the new draft with one uploaded ARM64 asset") end
+          ')
+          verify_tag
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -f tag_name="$GITHUB_REF_NAME" -F draft=false --jq .html_url
