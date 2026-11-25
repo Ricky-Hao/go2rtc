@@ -1,13 +1,14 @@
 diff --git a/internal/xiaomi/cloud_auth_test.go b/internal/xiaomi/cloud_auth_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..ac07adf55495afda18aaaac92942255d72694c9d
+index 0000000000000000000000000000000000000000..b1cc19fab3faa1bc263d0cffcf4e06f5ad868341
 --- /dev/null
 +++ b/internal/xiaomi/cloud_auth_test.go
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,248 @@
 +package xiaomi
 +
 +import (
 +	"errors"
++	"fmt"
 +	"net/http"
 +	"sync"
 +	"testing"
@@ -56,7 +57,7 @@ index 0000000000000000000000000000000000000000..ac07adf55495afda18aaaac92942255d
 +	oldTokens := tokens
 +	oldNewCloud := newCloud
 +
-+	clouds = nil
++	clouds = make(map[string]*cloudLogin)
 +	tokens = map[string]string{"user": "token"}
 +
 +	t.Cleanup(func() {
@@ -80,7 +81,7 @@ index 0000000000000000000000000000000000000000..ac07adf55495afda18aaaac92942255d
 +		},
 +	}
 +	created := []cloudClient{stale, refreshed}
-+	newCloud = func(userID string) (cloudClient, error) {
++	newCloud = func(userID, token string) (cloudClient, error) {
 +		require.Equal(t, "user", userID)
 +		cloud := created[0]
 +		created = created[1:]
@@ -93,38 +94,29 @@ index 0000000000000000000000000000000000000000..ac07adf55495afda18aaaac92942255d
 +	require.Equal(t, 1, stale.requestCount())
 +	require.Equal(t, 1, refreshed.requestCount())
 +	require.Empty(t, created)
-+	require.Same(t, refreshed, clouds["user"])
++	require.Same(t, refreshed, clouds["user"].client)
 +}
 +
 +func TestCloudRequestUsesAlreadyRefreshedCloud(t *testing.T) {
 +	resetCloudAuthTest(t)
-+
-+	refreshed := &fakeCloudClient{
-+		responses: []fakeCloudResponse{
-+			{body: []byte(`{"ok":true}`)},
-+		},
++	entered := make(chan struct{}, 2)
++	release := make(chan struct{})
++	stale := &fakeCloudClient{onRequest: func() { entered <- struct{}{}; <-release }, responses: []fakeCloudResponse{{err: pkgxiaomi.ErrUnauthorized}, {err: pkgxiaomi.ErrUnauthorized}}}
++	fresh := &fakeCloudClient{responses: []fakeCloudResponse{{body: []byte("ok")}, {body: []byte("ok")}}}
++	created := []cloudClient{stale, fresh}
++	newCloud = func(string, string) (cloudClient, error) { c := created[0]; created = created[1:]; return c, nil }
++	results := make(chan error, 2)
++	for range 2 {
++		go func() { _, err := cloudRequest("user", "cn", "/test", "{}"); results <- err }()
 +	}
-+	stale := &fakeCloudClient{
-+		responses: []fakeCloudResponse{
-+			{err: &pkgxiaomi.StatusError{StatusCode: http.StatusUnauthorized, Status: "401 Unauthorized"}},
-+		},
-+		onRequest: func() {
-+			cloudsMu.Lock()
-+			clouds["user"] = refreshed
-+			cloudsMu.Unlock()
-+		},
++	<-entered
++	<-entered
++	close(release)
++	for range 2 {
++		require.NoError(t, <-results)
 +	}
-+	clouds = map[string]cloudClient{"user": stale}
-+	newCloud = func(string) (cloudClient, error) {
-+		return nil, errors.New("unexpected cloud login")
-+	}
-+
-+	body, err := cloudRequest("user", "cn", "/v2/device/miss_get_vendor", "{}")
-+	require.NoError(t, err)
-+	require.Equal(t, []byte(`{"ok":true}`), body)
-+	require.Equal(t, 1, stale.requestCount())
-+	require.Equal(t, 1, refreshed.requestCount())
-+	require.Same(t, refreshed, clouds["user"])
++	require.Equal(t, 2, fresh.requestCount())
++	require.Empty(t, created)
 +}
 +
 +func TestCloudRequestDoesNotRefreshOnNonUnauthorizedError(t *testing.T) {
@@ -137,7 +129,7 @@ index 0000000000000000000000000000000000000000..ac07adf55495afda18aaaac92942255d
 +		},
 +	}
 +	created := []cloudClient{stale}
-+	newCloud = func(string) (cloudClient, error) {
++	newCloud = func(string, string) (cloudClient, error) {
 +		cloud := created[0]
 +		created = created[1:]
 +		return cloud, nil
@@ -148,7 +140,7 @@ index 0000000000000000000000000000000000000000..ac07adf55495afda18aaaac92942255d
 +	require.Nil(t, body)
 +	require.Equal(t, 1, stale.requestCount())
 +	require.Empty(t, created)
-+	require.Same(t, stale, clouds["user"])
++	require.Same(t, stale, clouds["user"].client)
 +}
 +
 +func TestCloudRequestRetriesOnlyOnceOnUnauthorized(t *testing.T) {
@@ -166,7 +158,7 @@ index 0000000000000000000000000000000000000000..ac07adf55495afda18aaaac92942255d
 +		},
 +	}
 +	created := []cloudClient{stale, refreshed}
-+	newCloud = func(string) (cloudClient, error) {
++	newCloud = func(string, string) (cloudClient, error) {
 +		cloud := created[0]
 +		created = created[1:]
 +		return cloud, nil
@@ -178,116 +170,186 @@ index 0000000000000000000000000000000000000000..ac07adf55495afda18aaaac92942255d
 +	require.Equal(t, 1, stale.requestCount())
 +	require.Equal(t, 1, refreshed.requestCount())
 +	require.Empty(t, created)
-+	require.Same(t, refreshed, clouds["user"])
++	require.Same(t, refreshed, clouds["user"].client)
 +}
 +
 +func TestSetUserTokenClearsCachedCloud(t *testing.T) {
 +	resetCloudAuthTest(t)
 +
 +	stale := &fakeCloudClient{}
-+	clouds = map[string]cloudClient{"user": stale}
++	newCloud = func(string, string) (cloudClient, error) { return stale, nil }
++	_, err := getCloud("user", nil)
++	require.NoError(t, err)
 +
 +	setUserToken("user", "new-token")
 +
 +	require.Equal(t, "new-token", tokens["user"])
 +	require.NotContains(t, clouds, "user")
 +}
++
++func TestCloudTokenChangeDuringLogin(t *testing.T) {
++	for _, fail := range []bool{false, true} {
++		t.Run(fmt.Sprintf("old-login-fails=%t", fail), func(t *testing.T) {
++			resetCloudAuthTest(t)
++			entered, release := make(chan struct{}), make(chan struct{})
++			fresh := &fakeCloudClient{}
++			temporary := errors.New("temporary login failure")
++			newCloud = func(id, token string) (cloudClient, error) {
++				if id == "user" && token == "token" {
++					close(entered)
++					<-release
++					if fail {
++						return nil, temporary
++					}
++					return &fakeCloudClient{}, nil
++				}
++				return fresh, nil
++			}
++			result := make(chan error, 1)
++			go func() { _, err := getCloud("user", nil); result <- err }()
++			<-entered
++			_, err := getCloud("other", nil)
++			require.NoError(t, err)
++			setUserToken("user", "replacement")
++			current, err := getCloud("user", nil)
++			require.NoError(t, err)
++			close(release)
++			if fail {
++				require.ErrorIs(t, <-result, temporary)
++			} else {
++				require.NoError(t, <-result)
++			}
++			again, err := getCloud("user", nil)
++			require.NoError(t, err)
++			require.Same(t, current, again)
++			require.Same(t, fresh, again.client)
++		})
++	}
++}
++
++func TestCloudRequestRecoversAfterRefreshFailure(t *testing.T) {
++	resetCloudAuthTest(t)
++	stale := &fakeCloudClient{responses: []fakeCloudResponse{{err: pkgxiaomi.ErrUnauthorized}}}
++	fresh := &fakeCloudClient{responses: []fakeCloudResponse{{body: []byte("ok")}}}
++	temporary := errors.New("temporary login failure")
++	calls := 0
++	newCloud = func(string, string) (cloudClient, error) {
++		calls++
++		switch calls {
++		case 1:
++			return stale, nil
++		case 2:
++			return nil, temporary
++		default:
++			return fresh, nil
++		}
++	}
++	_, err := cloudRequest("user", "tw", "/test", "{}")
++	require.ErrorIs(t, err, pkgxiaomi.ErrUnauthorized)
++	require.ErrorIs(t, err, temporary)
++	body, err := cloudRequest("user", "in", "/test", "{}")
++	require.NoError(t, err)
++	require.Equal(t, "ok", string(body))
++	require.Equal(t, 3, calls)
++}
 diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
-index 38421418c17bf56a607e9d74b3c3555e46b9ce67..00b99d4b6654abe73ca8adff490b54013ee121fd 100644
+index cd26353befd5df00d24d1d8b34590851bf916310..3c08c882582b173f8b18873de1561d9a36a845d5 100644
 --- a/internal/xiaomi/xiaomi.go
 +++ b/internal/xiaomi/xiaomi.go
-@@ -53,10 +53,22 @@ func Init() {
+@@ -53,35 +53,76 @@ func Init() {
  var log zerolog.Logger
  
  var tokens map[string]string
 -var clouds map[string]*xiaomi.Cloud
-+var clouds map[string]cloudClient
++var clouds = make(map[string]*cloudLogin)
  var cloudsMu sync.Mutex
  
 -func getCloud(userID string) (*xiaomi.Cloud, error) {
+-	cloudsMu.Lock()
+-	defer cloudsMu.Unlock()
+-
+-	if cloud := clouds[userID]; cloud != nil {
+-		return cloud, nil
+-	}
 +type cloudClient interface {
 +	Request(baseURL, apiURL, params string, headers map[string]string) ([]byte, error)
 +}
-+
-+var newCloud = func(userID string) (cloudClient, error) {
-+	cloud := xiaomi.NewCloud(AppXiaomiHome)
-+	if err := cloud.LoginWithToken(userID, tokens[userID]); err != nil {
-+		return nil, err
-+	}
-+	return cloud, nil
-+}
-+
-+func getCloud(userID string) (cloudClient, error) {
- 	cloudsMu.Lock()
- 	defer cloudsMu.Unlock()
  
-@@ -64,12 +76,12 @@ func getCloud(userID string) (*xiaomi.Cloud, error) {
- 		return cloud, nil
- 	}
- 
--	cloud := xiaomi.NewCloud(AppXiaomiHome)
++var newCloud = func(userID, token string) (cloudClient, error) {
+ 	cloud := xiaomi.NewCloud(AppXiaomiHome)
 -	if err := cloud.LoginWithToken(userID, tokens[userID]); err != nil {
-+	cloud, err := newCloud(userID)
-+	if err != nil {
++	if err := cloud.LoginWithToken(userID, token); err != nil {
  		return nil, err
  	}
- 	if clouds == nil {
+-	if clouds == nil {
 -		clouds = map[string]*xiaomi.Cloud{userID: cloud}
-+		clouds = map[string]cloudClient{userID: cloud}
- 	} else {
- 		clouds[userID] = cloud
- 	}
-@@ -81,7 +93,48 @@ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
+-	} else {
+-		clouds[userID] = cloud
+-	}
+ 	return cloud, nil
+ }
+ 
++// A login owns its result even if a token change replaces the cache entry.
++type cloudLogin struct {
++	ready  chan struct{}
++	client cloudClient
++	err    error
++}
++
++func getCloud(userID string, stale *cloudLogin) (*cloudLogin, error) {
++	cloudsMu.Lock()
++	if login := clouds[userID]; login != nil && login != stale {
++		cloudsMu.Unlock()
++		<-login.ready
++		return login, login.err
++	}
++	token := tokens[userID]
++	login := &cloudLogin{ready: make(chan struct{})}
++	clouds[userID] = login
++	cloudsMu.Unlock()
++
++	login.client, login.err = newCloud(userID, token)
++	cloudsMu.Lock()
++	if login.err != nil && clouds[userID] == login {
++		delete(clouds, userID)
++	}
++	close(login.ready)
++	cloudsMu.Unlock()
++	return login, login.err
++}
++
+ func cloudRequest(userID, region, apiURL, params string) ([]byte, error) {
+-	cloud, err := getCloud(userID)
++	login, err := getCloud(userID, nil)
  	if err != nil {
  		return nil, err
  	}
 -	return cloud.Request(GetBaseURL(region), apiURL, params, nil)
 +	baseURL := GetBaseURL(region)
-+	res, err := cloud.Request(baseURL, apiURL, params, nil)
++	res, err := login.client.Request(baseURL, apiURL, params, nil)
 +	if !errors.Is(err, xiaomi.ErrUnauthorized) {
 +		return res, err
 +	}
 +
-+	cloud, refreshErr := refreshCloud(userID, cloud)
++	login, refreshErr := getCloud(userID, login)
 +	if refreshErr != nil {
 +		return nil, fmt.Errorf("xiaomi: refresh cloud auth after %w: %w", err, refreshErr)
 +	}
-+	return cloud.Request(baseURL, apiURL, params, nil)
-+}
-+
-+func refreshCloud(userID string, stale cloudClient) (cloudClient, error) {
-+	cloudsMu.Lock()
-+	defer cloudsMu.Unlock()
-+
-+	if cloud := clouds[userID]; cloud != nil && cloud != stale {
-+		return cloud, nil
-+	}
-+
-+	cloud, err := newCloud(userID)
-+	if err != nil {
-+		return nil, err
-+	}
-+	if clouds == nil {
-+		clouds = map[string]cloudClient{userID: cloud}
-+	} else {
-+		clouds[userID] = cloud
-+	}
-+	return cloud, nil
++	return login.client.Request(baseURL, apiURL, params, nil)
 +}
 +
 +func setUserToken(userID, token string) {
 +	cloudsMu.Lock()
 +	if tokens == nil {
-+		tokens = map[string]string{userID: token}
-+	} else {
-+		tokens[userID] = token
++		tokens = make(map[string]string)
 +	}
++	tokens[userID] = token
 +	delete(clouds, userID)
 +	cloudsMu.Unlock()
  }
  
  func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error) {
-@@ -365,13 +418,7 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
+@@ -327,13 +368,7 @@ func apiAuth(w http.ResponseWriter, r *http.Request) {
  		userID, token := auth.UserToken()
  		auth = nil
  
@@ -340,3 +402,53 @@ index 0dcfd241417a9a756e282f555acd842bbe17f75f..f5e61ed735dc879031b07b1b5dca1db0
  	}
  
  	body, err := io.ReadAll(res.Body)
+diff --git a/pkg/xiaomi/cloud_test.go b/pkg/xiaomi/cloud_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f364493e832e8cd3d4ef70efd7bfe1b4fdee313
+--- /dev/null
++++ b/pkg/xiaomi/cloud_test.go
+@@ -0,0 +1,44 @@
++package xiaomi
++
++import (
++	"encoding/base64"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestCloudRequestStatusAndAPIError(t *testing.T) {
++	c := NewCloud("fixture")
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/expired":
++			w.WriteHeader(http.StatusUnauthorized)
++		case "/forbidden":
++			w.WriteHeader(http.StatusForbidden)
++		default:
++			nonce, err := base64.StdEncoding.DecodeString(r.FormValue("_nonce"))
++			if err != nil {
++				t.Error(err)
++				return
++			}
++			body, err := crypt(genSignedNonce(c.ssecurity, nonce), []byte(`{"code":-1,"message":"vendor unavailable"}`))
++			if err != nil {
++				t.Error(err)
++				return
++			}
++			_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString(body)))
++		}
++	}))
++	defer srv.Close()
++	_, err := c.Request(srv.URL, "/expired", "{}", nil)
++	require.ErrorIs(t, err, ErrUnauthorized)
++	_, err = c.Request(srv.URL, "/forbidden", "{}", nil)
++	var status *StatusError
++	require.ErrorAs(t, err, &status)
++	require.Equal(t, http.StatusForbidden, status.StatusCode)
++	require.NotErrorIs(t, err, ErrUnauthorized)
++	_, err = c.Request(srv.URL, "/vendor", "{}", nil)
++	require.EqualError(t, err, "xiaomi: vendor unavailable")
++}

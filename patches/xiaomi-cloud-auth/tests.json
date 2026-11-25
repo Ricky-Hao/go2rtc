@@ -15,7 +15,20 @@
         "TestCloudRequestUsesAlreadyRefreshedCloud",
         "TestCloudRequestDoesNotRefreshOnNonUnauthorizedError",
         "TestCloudRequestRetriesOnlyOnceOnUnauthorized",
-        "TestSetUserTokenClearsCachedCloud"
+        "TestSetUserTokenClearsCachedCloud",
+        "TestCloudTokenChangeDuringLogin",
+        "TestCloudRequestRecoversAfterRefreshFailure"
+      ]
+    },
+    {
+      "name": "Xiaomi cloud HTTP status and API errors",
+      "tier": "focused",
+      "cwd": ".",
+      "requires": ["go.mod", "pkg/xiaomi/cloud_test.go"],
+      "runner": "go",
+      "package": "./pkg/xiaomi",
+      "tests": [
+        "TestCloudRequestStatusAndAPIError"
       ]
     }
   ]

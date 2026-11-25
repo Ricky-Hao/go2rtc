@@ -4,7 +4,11 @@ Two channels of the same Xiaomi MISS camera can stream over one physical connect
 
 A dropped channel can restart while its peer remains active. The session reissues the dual-channel request with the current qualities when both channels are available, or falls back to a single-channel request when the peer has left. Both paths preserve the shared audio settings.
 
+Concurrent sources for the same endpoint share the physical dial. A different camera can dial while the first camera connects or shuts down. Sharing requires compatible credentials, model, transport and per-lens quality. The last successful video-start command determines whether packets need classifying. Each producer times out after ten seconds without video from its lens, even while shared audio continues. Multiple readers can subscribe to either lens.
+
 `#backchannel=0` preserves incoming audio and omits the speaker path, including after reconnect. The default still negotiates supported talkback. The generated `internal/xiaomi/README.md` describes channel selection and how to set the option consistently on sources sharing a camera. The generated `internal/xiaomi/MISS_REFACTOR_IMPLEMENTATION_PLAN.md` preserves the implementation plan.
+
+When video is ready and the receive audio codec is unknown, the probe waits up to one second for audio within its 15-second total budget. It returns as soon as it identifies the codec. On timeout it advertises PCMA at 8 kHz. Opus first observed after fallback requires a newly negotiated receive track. `audio=0` and a cached receive codec both skip the audio wait.
 
 The group applies directly to the manifest base, independently of cloud authentication refresh. The physical connection is closed after a shared read error before the logical readers are notified to reconnect. That ordering carries the upstream camera-slot fix into the shared session. [Upstream close fix](https://github.com/AlexxIT/go2rtc/commit/41ce11e4c0bfedd87824f1464b541845611856cf) · [CS2 overflow replacement](../cs2-media-buffer/README.md) · [Cloud authentication refresh](../xiaomi-cloud-auth/README.md)
 

@@ -45,7 +45,8 @@
       "paths": [
         "internal/xiaomi/cloud_auth_test.go",
         "internal/xiaomi/xiaomi.go",
-        "pkg/xiaomi/cloud.go"
+        "pkg/xiaomi/cloud.go",
+        "pkg/xiaomi/cloud_test.go"
       ],
       "tests": "patches/xiaomi-cloud-auth/tests.json"
     }

@@ -14,7 +14,7 @@ The original migration used the common base `dc1685e9cf7a8c349181f20a1b4a44825ed
 
 The shared-session delta incorporates the demux work (`ada7280`), TTL and close hardening (`941ef98`, `df75537`), the cache and classifier extraction (`ae7c4c3`, `90ed39a`), lifecycle, channel and URL fixes (`147722f`, `b413212`, `89b3fc5`, `cef242e`) and the shared-audio changes (`70c79d3`, `c8bf4fb`, `e5a475d`, `0c977de`). The historical implementation plan is retained at `internal/xiaomi/MISS_REFACTOR_IMPLEMENTATION_PLAN.md`, blob `97807acb2267d28c7f53082ce93fc616b096ba49`.
 
-The three-group replay combined the former `miss-shared-session`, `miss-channel-reconnect` and `miss-receive-only` deltas after the separate CS2 patch. The current replay uses the official CS2 fix. `xiaomi-miss` is exported from the pinned base and `xiaomi-cloud-auth` is exported from the staged MISS tree. Each applies independently from the official base. [CS2 replacement](../patches/cs2-media-buffer/README.md) · [Seven-group payloads](https://github.com/Ricky-Hao/go2rtc/tree/84c6b07d5ce3d84cdbf99efce1c5668c7451344a/patches)
+The three-group replay combined the former `miss-shared-session`, `miss-channel-reconnect` and `miss-receive-only` deltas after the separate CS2 patch. The current replay uses the official CS2 fix. Both Xiaomi payloads are exported from independent checkouts at the pinned base. [CS2 replacement](../patches/cs2-media-buffer/README.md) · [Seven-group payloads](https://github.com/Ricky-Hao/go2rtc/tree/84c6b07d5ce3d84cdbf99efce1c5668c7451344a/patches)
 
 ## Workflow lineage
 

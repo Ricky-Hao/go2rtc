@@ -59,7 +59,12 @@
         "TestSessionStartMediaDualFailureDoesNotMarkSecondChannelStarted",
         "TestSessionManagerRedialsAfterReadError",
         "TestSessionManagerRedialsAfterLastStreamClose",
-        "TestSessionManagerConcurrentAcquireClosesDuplicateClient",
+        "TestSessionManagerConcurrentAcquireDialsOnce",
+        "TestSessionManagerReservesClosingDevice",
+        "TestSessionManagerDefaultPorts",
+        "TestSessionCompatibility",
+        "TestDialSharesBothLensesAndDuplicateReader",
+        "TestProbeNegotiatesVideoThenOpus",
         "TestParseChannel",
         "TestDialRejectsMalformedURL"
       ]
@@ -70,13 +75,15 @@
       "cwd": ".",
       "requires": [
         "go.mod",
+        "pkg/xiaomi/miss/producer_test.go",
         "pkg/xiaomi/miss/session_manager_test.go"
       ],
       "runner": "go",
       "package": "./pkg/xiaomi/miss",
       "tests": [
         "TestSessionRestartDroppedChannelReissuesDualStart",
-        "TestSessionRestartDroppedChannelFallsBackToSingleWhenPeerGone"
+        "TestSessionRestartDroppedChannelFallsBackToSingleWhenPeerGone",
+        "TestSessionVideoTimeoutKeepsPeer"
       ]
     },
     {

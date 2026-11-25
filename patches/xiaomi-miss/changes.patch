@@ -559,21 +559,32 @@ index 0000000000000000000000000000000000000000..97807acb2267d28c7f53082ce93fc616
 +reviewed before follow-up behavior changes such as moving `startMedia` network
 +I/O out of `session.mu`.
 diff --git a/internal/xiaomi/README.md b/internal/xiaomi/README.md
-index 330183e8c0af197a9ae0b4519c20effa64116c34..987cbb340f96703424d753ee34512ffff6e6125c 100644
+index 330183e8c0af197a9ae0b4519c20effa64116c34..38f6b4e362125950569ad0bdeb9008d757e2ae6c 100644
 --- a/internal/xiaomi/README.md
 +++ b/internal/xiaomi/README.md
-@@ -56,9 +56,19 @@ streams:
+@@ -56,9 +56,30 @@ streams:
    xiaomi1: xiaomi://***&subtype=sd
  ```
  
 -You can use a second channel for dual cameras: `channel=2`.
-+You can use a second channel for dual cameras: `channel=1`.
++For a dual MISS camera, use the same camera URL for both sources and select
++`channel=0` (the default) or `channel=1`. Both lenses share one connection.
++Use the same host, account, region and device credentials. An explicit CS2
++transport must match the active connection. Each lens can have its own quality.
++Sources reading the same lens must agree on its quality.
  
  ```yaml
  streams:
 -  xiaomi1: xiaomi://***&channel=2
-+  xiaomi1: xiaomi://***&channel=1
++  main_lens: xiaomi://***&channel=0
++  second_lens: xiaomi://***&channel=1
 +```
++
++The probe allows up to 15 seconds for a video header. Once video is ready, it
++waits at most one more second for an unknown receive audio codec, within the
++same 15-second limit. A cached codec or `audio=0` lets video start immediately.
++If audio is still unknown, the source advertises PCMA at 8 kHz. Opus first
++observed after this window requires a newly negotiated receive track.
 +
 +You can keep camera audio while disabling two-way audio with
 +`#backchannel=0`. Add it to every source for the same camera. The option takes
@@ -777,9 +788,18 @@ index 0000000000000000000000000000000000000000..456bbb0cb64529ccc89f588a799c6f29
 +	require.Equal(t, "old", got.Query().Get("uid"))
 +}
 diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
-index cd26353befd5df00d24d1d8b34590851bf916310..38421418c17bf56a607e9d74b3c3555e46b9ce67 100644
+index cd26353befd5df00d24d1d8b34590851bf916310..f4205e9eec1be82dae916c0ce5926ae823369e55 100644
 --- a/internal/xiaomi/xiaomi.go
 +++ b/internal/xiaomi/xiaomi.go
+@@ -42,7 +42,7 @@ func Init() {
+ 			}
+ 		}
+ 
+-		log.Debug().Msgf("xiaomi: dial %s", rawURL)
++		log.Debug().Str("host", u.Host).Msg("xiaomi: dial")
+ 
+ 		return xiaomi.Dial(rawURL)
+ 	})
 @@ -150,12 +150,34 @@ func getLegacyURL(url *url.URL) (string, error) {
  }
  
@@ -854,7 +874,7 @@ index cd26353befd5df00d24d1d8b34590851bf916310..38421418c17bf56a607e9d74b3c3555e
  	return url.String(), nil
  }
 diff --git a/pkg/xiaomi/miss/backchannel.go b/pkg/xiaomi/miss/backchannel.go
-index 02ea3bb1d01107f894f2b3f1f7582ad523e46442..c0514f29d0029b9ee8dc82bea4be4185dfe321f3 100644
+index 02ea3bb1d01107f894f2b3f1f7582ad523e46442..48adc4e55c07749d8ed0757b7021ae834eaaa9ea 100644
 --- a/pkg/xiaomi/miss/backchannel.go
 +++ b/pkg/xiaomi/miss/backchannel.go
 @@ -1,6 +1,7 @@
@@ -865,34 +885,30 @@ index 02ea3bb1d01107f894f2b3f1f7582ad523e46442..c0514f29d0029b9ee8dc82bea4be4185
  	"time"
  
  	"github.com/AlexxIT/go2rtc/pkg/core"
-@@ -9,29 +10,34 @@ import (
+@@ -9,29 +10,28 @@ import (
  	"github.com/pion/rtp"
  )
  
 -func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiver) error {
 -	if err := p.client.StartSpeaker(); err != nil {
 +func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
-+	if err := p.stream.session.startSpeaker(); err != nil {
- 		return err
- 	}
- 	// TODO: check this!!!
- 	time.Sleep(time.Second)
- 
--	sender := core.NewSender(media, track.Codec)
 +	sourceCodec, err := backchannelCodec(codec, track.Codec)
 +	if err != nil {
-+		return err
-+	}
+ 		return err
+ 	}
+-	// TODO: check this!!!
+-	time.Sleep(time.Second)
+ 
+-	sender := core.NewSender(media, track.Codec)
++	sender := core.NewSender(media, sourceCodec)
  
 -	switch track.Codec.Name {
-+	sender := core.NewSender(media, sourceCodec)
-+
 +	switch sourceCodec.Name {
  	case core.CodecPCMA:
  		var buf []byte
  
 -		if p.client.SpeakerCodec() == codecPCM {
-+		if p.stream.session.speakerCodec() == codecPCM {
++		if p.stream.session.client.SpeakerCodec() == codecPCM {
  			dst := &core.Codec{Name: core.CodecPCML, ClockRate: 8000}
 -			transcode := pcm.Transcode(dst, track.Codec)
 +			transcode := pcm.Transcode(dst, sourceCodec)
@@ -907,7 +923,7 @@ index 02ea3bb1d01107f894f2b3f1f7582ad523e46442..c0514f29d0029b9ee8dc82bea4be4185
  					buf = buf[size:]
  				}
  			}
-@@ -41,13 +47,13 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
+@@ -41,13 +41,13 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
  				const size = 8000 * 0.040 // 8bit 40 ms
  				for len(buf) >= size {
  					p.Send += size
@@ -919,11 +935,11 @@ index 02ea3bb1d01107f894f2b3f1f7582ad523e46442..c0514f29d0029b9ee8dc82bea4be4185
  		}
  	case core.CodecOpus:
 -		if p.client.SpeakerCodec() == codecOPUS {
-+		if p.stream.session.speakerCodec() == codecOPUS {
++		if p.stream.session.client.SpeakerCodec() == codecOPUS {
  			var buf []byte
  			sender.Handler = func(pkt *rtp.Packet) {
  				if buf == nil {
-@@ -56,19 +62,49 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
+@@ -56,19 +56,55 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
  					// convert two 20ms to one 40ms
  					buf = opus.JoinFrames(buf, pkt.Payload)
  					p.Send += len(buf)
@@ -943,6 +959,12 @@ index 02ea3bb1d01107f894f2b3f1f7582ad523e46442..c0514f29d0029b9ee8dc82bea4be4185
 +		return fmt.Errorf("xiaomi: unsupported backchannel codec: %s", sourceCodec.Name)
  	}
  
++	if err := p.stream.session.startSpeaker(); err != nil {
++		return err
++	}
++	// TODO: check this!!!
++	time.Sleep(time.Second)
++
  	sender.HandleRTP(track)
  	p.Senders = append(p.Senders, sender)
  	return nil
@@ -977,13 +999,15 @@ index 02ea3bb1d01107f894f2b3f1f7582ad523e46442..c0514f29d0029b9ee8dc82bea4be4185
 +}
 diff --git a/pkg/xiaomi/miss/classifier.go b/pkg/xiaomi/miss/classifier.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..87b0c19a334ae742eb6e465893810f8fcf38e0ae
+index 0000000000000000000000000000000000000000..dfcf8aee94f0b1efa138386bbd3105e0c1abd34b
 --- /dev/null
 +++ b/pkg/xiaomi/miss/classifier.go
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,181 @@
 +package miss
 +
 +import (
++	"encoding/binary"
++
 +	"github.com/AlexxIT/go2rtc/pkg/h264"
 +	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
 +	"github.com/AlexxIT/go2rtc/pkg/h265"
@@ -1006,73 +1030,46 @@ index 0000000000000000000000000000000000000000..87b0c19a334ae742eb6e465893810f8f
 +// Classify runs through classification strategies in priority order.
 +// The caller must serialize calls.
 +func (c *packetClassifier) Classify(pkt *Packet) uint8 {
-+	ch := c.classify(pkt)
-+	c.lastTS[ch] = pkt.Timestamp
-+	c.tsInit[ch] = true
++	ch, _ := c.classify(pkt, false)
 +	return ch
 +}
 +
 +func (c *packetClassifier) ClassifyKnown(pkt *Packet) (uint8, bool) {
-+	ch, ok := c.classifyKnown(pkt)
-+	if ok {
++	return c.classify(pkt, true)
++}
++
++func (c *packetClassifier) classify(pkt *Packet, knownOnly bool) (uint8, bool) {
++	ch, known := c.channel(pkt, knownOnly)
++	if known || !knownOnly {
 +		c.lastTS[ch] = pkt.Timestamp
 +		c.tsInit[ch] = true
 +	}
-+	return ch, ok
++	return ch, known
 +}
 +
-+func (c *packetClassifier) classify(pkt *Packet) uint8 {
-+	// Strategy 1: hdr[28] channel field.
-+	// Trusted only after seeing both 0 and 1.
-+	if pkt.ChannelOK {
-+		c.hdrChanSeen[pkt.Channel] = true
-+		if c.hdrChanSeen[0] && c.hdrChanSeen[1] {
-+			return pkt.Channel
-+		}
-+	}
-+
-+	// Strategy 2: (flags >> 24) & 0x01.
-+	fch := pkt.FlagsChannel
-+	c.flagsChanSeen[fch] = true
-+	if c.flagsChanSeen[0] && c.flagsChanSeen[1] {
-+		return fch
-+	}
-+
-+	// Strategy 3: Resolution from SPS in keyframes.
-+	if ch, ok := c.classifyByResolution(pkt); ok {
-+		return ch
-+	}
-+
-+	// Strategy 4: Timestamp continuity.
-+	if c.tsInit[0] && c.tsInit[1] {
-+		return c.classifyByTimestamp(pkt)
-+	}
-+
-+	return 0
-+}
-+
-+func (c *packetClassifier) classifyKnown(pkt *Packet) (uint8, bool) {
++func (c *packetClassifier) channel(pkt *Packet, knownOnly bool) (uint8, bool) {
 +	if pkt.ChannelOK {
 +		c.hdrChanSeen[pkt.Channel] = true
 +		if c.hdrChanSeen[0] && c.hdrChanSeen[1] {
 +			return pkt.Channel, true
 +		}
 +	}
-+
 +	fch := pkt.FlagsChannel
 +	c.flagsChanSeen[fch] = true
 +	if c.flagsChanSeen[0] && c.flagsChanSeen[1] {
 +		return fch, true
 +	}
-+
-+	if ch, ok := c.classifyByKnownResolution(pkt); ok {
-+		return ch, true
++	if area := videoResolutionArea(pkt); area != 0 {
++		if _, ok := c.resolutions[area]; !ok {
++			c.assignResolution(area)
++		}
++		if !knownOnly || len(c.resolutions) > 1 {
++			return c.resolutions[area], true
++		}
 +	}
-+
 +	if c.tsInit[0] && c.tsInit[1] {
 +		return c.classifyByTimestamp(pkt), true
 +	}
-+
 +	return 0, false
 +}
 +
@@ -1105,45 +1102,6 @@ index 0000000000000000000000000000000000000000..87b0c19a334ae742eb6e465893810f8f
 +	return 1
 +}
 +
-+// classifyByResolution uses SPS from keyframes to map resolution -> channel.
-+// Higher resolution = channel 0, lower = channel 1.
-+func (c *packetClassifier) classifyByResolution(pkt *Packet) (uint8, bool) {
-+	area := videoResolutionArea(pkt)
-+	if area == 0 {
-+		return 0, false
-+	}
-+
-+	if ch, ok := c.resolutions[area]; ok {
-+		return ch, true
-+	}
-+
-+	c.assignResolution(area)
-+	if ch, ok := c.resolutions[area]; ok {
-+		return ch, true
-+	}
-+	return 0, false
-+}
-+
-+func (c *packetClassifier) classifyByKnownResolution(pkt *Packet) (uint8, bool) {
-+	area := videoResolutionArea(pkt)
-+	if area == 0 {
-+		return 0, false
-+	}
-+
-+	if len(c.resolutions) >= 2 {
-+		if ch, ok := c.resolutions[area]; ok {
-+			return ch, true
-+		}
-+	}
-+
-+	c.assignResolution(area)
-+	if len(c.resolutions) < 2 {
-+		return 0, false
-+	}
-+	ch, ok := c.resolutions[area]
-+	return ch, ok
-+}
-+
 +// assignResolution adds a resolution and assigns channels.
 +// Higher resolution -> channel 0, lower -> channel 1.
 +func (c *packetClassifier) assignResolution(newArea uint32) {
@@ -1171,9 +1129,15 @@ index 0000000000000000000000000000000000000000..87b0c19a334ae742eb6e465893810f8f
 +
 +// videoResolutionArea extracts width*height from H264/H265 SPS in a keyframe.
 +func videoResolutionArea(pkt *Packet) uint32 {
++	if pkt.CodecID != codecH264 && pkt.CodecID != codecH265 {
++		return 0
++	}
++	avcc := pkt.videoAVCC()
++	if len(avcc) == 0 {
++		return 0
++	}
 +	switch pkt.CodecID {
 +	case codecH264:
-+		avcc := annexb.EncodeToAVCC(pkt.Payload)
 +		if h264.NALUType(avcc) == h264.NALUTypeSPS {
 +			sps := h264.DecodeSPS(avcc[4:]) // skip 4-byte AVCC length prefix
 +			if sps != nil {
@@ -1181,7 +1145,6 @@ index 0000000000000000000000000000000000000000..87b0c19a334ae742eb6e465893810f8f
 +			}
 +		}
 +	case codecH265:
-+		avcc := annexb.EncodeToAVCC(pkt.Payload)
 +		if h265.NALUType(avcc) == h265.NALUTypeVPS {
 +			// H265 keyframes start with VPS, then SPS. Find the SPS.
 +			spsData := findH265SPS(avcc)
@@ -1198,19 +1161,28 @@ index 0000000000000000000000000000000000000000..87b0c19a334ae742eb6e465893810f8f
 +
 +// findH265SPS searches for an SPS NALU in AVCC-formatted H265 data.
 +func findH265SPS(avcc []byte) []byte {
-+	for i := 0; i+4 < len(avcc); {
-+		size := int(avcc[i])<<24 | int(avcc[i+1])<<16 | int(avcc[i+2])<<8 | int(avcc[i+3])
-+		i += 4
-+		if size <= 0 || i+size > len(avcc) {
-+			break
++	for len(avcc) != 0 {
++		end := 4 + int(binary.BigEndian.Uint32(avcc))
++		if h265.NALUType(avcc) == h265.NALUTypeSPS {
++			return avcc[4:end]
 +		}
-+		naluType := (avcc[i] >> 1) & 0x3F
-+		if naluType == h265.NALUTypeSPS {
-+			return avcc[i : i+size]
-+		}
-+		i += size
++		avcc = avcc[end:]
 +	}
 +	return nil
++}
++
++// EncodeToAVCC generates the length prefixes. The codec readers also need a
++// NAL header, and H264 profile-level-id reads three bytes following an SPS header.
++func (pkt *Packet) videoAVCC() []byte {
++	avcc := annexb.EncodeToAVCC(pkt.Payload)
++	for nal := avcc; len(nal) != 0; {
++		size := int(binary.BigEndian.Uint32(nal))
++		if size == 0 || (pkt.CodecID == codecH264 && h264.NALUType(nal) == h264.NALUTypeSPS && size < 4) {
++			return nil
++		}
++		nal = nal[4+size:]
++	}
++	return avcc
 +}
 diff --git a/pkg/xiaomi/miss/classifier_test.go b/pkg/xiaomi/miss/classifier_test.go
 new file mode 100644
@@ -1295,27 +1267,61 @@ index 0000000000000000000000000000000000000000..f2adde1a61869f4bf16af70d2ca3af8f
 +	require.Equal(t, uint8(1), c.Classify(&Packet{Timestamp: 150}))
 +}
 diff --git a/pkg/xiaomi/miss/client.go b/pkg/xiaomi/miss/client.go
-index 3113632a1cd7521a038c564c08a3af6342be2d80..96d864cab4b94cf02ceef73f052bcbdafc6df193 100644
+index 3113632a1cd7521a038c564c08a3af6342be2d80..5be0fed483cc6385ccce242d94abaf9962cecbb7 100644
 --- a/pkg/xiaomi/miss/client.go
 +++ b/pkg/xiaomi/miss/client.go
-@@ -126,6 +126,16 @@ func (c *Client) Version() string {
+@@ -44,7 +44,11 @@ func NewClient(rawURL string) (*Client, error) {
+ 
+ 	// 1. Check if we can create shared key.
+ 	query := u.Query()
+-	key, err := crypto.CalcSharedKey(query.Get("device_public"), query.Get("client_private"))
++	public, private := query.Get("device_public"), query.Get("client_private")
++	if len(public) != 64 || len(private) != 64 {
++		return nil, errors.New("miss: expected 32-byte device public and client private keys in hex")
++	}
++	key, err := crypto.CalcSharedKey(public, private)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -66,6 +70,10 @@ func NewClient(rawURL string) (*Client, error) {
+ 		return nil, err
+ 	}
+ 
++	if query.Get("vendor") == "cs2" {
++		// CS2 clears its handshake deadline. TUTK already bounds login.
++		_ = conn.SetDeadline(time.Now().Add(mediaTimeout))
++	}
+ 	err = login(conn, query.Get("client_public"), query.Get("sign"))
+ 	if err != nil {
+ 		_ = conn.Close()
+@@ -126,6 +134,16 @@ func (c *Client) Version() string {
  	return fmt.Sprintf("%s (%s)", c.Conn.Version(), c.model)
  }
  
 +// IsDafangLike returns true for models that use the dafang firmware
 +// protocol and do not support standard dual-channel commands.
 +func (c *Client) IsDafangLike() bool {
-+	switch c.model {
-+	case ModelDafang, ModelXiaofang:
-+		return true
-+	}
-+	return false
++	return isDafangLike(c.model)
++}
++
++func isDafangLike(model string) bool {
++	return model == ModelDafang || model == ModelXiaofang
 +}
 +
  func (c *Client) WriteCommand(data []byte) error {
  	data, err := crypto.Encode(data, c.key)
  	if err != nil {
-@@ -161,23 +171,7 @@ func (c *Client) StartMedia(channel, quality, audio string) error {
+@@ -145,8 +163,7 @@ const (
+ )
+ 
+ func (c *Client) StartMedia(channel, quality, audio string) error {
+-	switch c.model {
+-	case ModelDafang, ModelXiaofang:
++	if c.IsDafangLike() {
+ 		var q, a byte
+ 		if quality == "sd" {
+ 			q = 1 // 0 - hd, 1 - sd, default - hd
+@@ -161,23 +178,7 @@ func (c *Client) StartMedia(channel, quality, audio string) error {
  		)
  	}
  
@@ -1336,18 +1342,18 @@ index 3113632a1cd7521a038c564c08a3af6342be2d80..96d864cab4b94cf02ceef73f052bcbda
 -	case "auto":
 -		quality = "0"
 -	}
-+	quality = c.normalizeQuality(quality)
++	quality = normalizeQuality(c.model, quality)
  
  	if audio == "" {
  		audio = "1"
-@@ -193,6 +187,37 @@ func (c *Client) StartMedia(channel, quality, audio string) error {
+@@ -193,6 +194,37 @@ func (c *Client) StartMedia(channel, quality, audio string) error {
  	return c.WriteCommand(data)
  }
  
 +// StartMediaDual starts both channel 0 and channel 1 in a single command.
 +func (c *Client) StartMediaDual(quality0, quality1, audio string) error {
-+	quality0 = c.normalizeQuality(quality0)
-+	quality1 = c.normalizeQuality(quality1)
++	quality0 = normalizeQuality(c.model, quality0)
++	quality1 = normalizeQuality(c.model, quality1)
 +	if audio == "" {
 +		audio = "1"
 +	}
@@ -1357,11 +1363,11 @@ index 3113632a1cd7521a038c564c08a3af6342be2d80..96d864cab4b94cf02ceef73f052bcbda
 +}
 +
 +// normalizeQuality converts user-facing quality strings to protocol values.
-+func (c *Client) normalizeQuality(quality string) string {
++func normalizeQuality(model, quality string) string {
 +	// 0 - auto, 1 - sd, 2 - hd, default - hd
 +	switch quality {
 +	case "", "hd":
-+		switch c.model {
++		switch model {
 +		case ModelC200, ModelC300:
 +			return "3"
 +		default:
@@ -1378,19 +1384,24 @@ index 3113632a1cd7521a038c564c08a3af6342be2d80..96d864cab4b94cf02ceef73f052bcbda
  func (c *Client) StopMedia() error {
  	data := binary.BigEndian.AppendUint32(nil, cmdVideoStop)
  	return c.WriteCommand(data)
-@@ -243,6 +268,20 @@ func (c *Client) ReadPacket() (*Packet, error) {
+@@ -231,6 +263,9 @@ func (c *Client) ReadPacket() (*Packet, error) {
+ 		return nil, fmt.Errorf("miss: packet header too small")
+ 	}
+ 
++	if len(payload) < 8 {
++		return nil, errors.New("miss: missing media nonce")
++	}
+ 	payload, err = crypto.Decode(payload, c.key)
+ 	if err != nil {
+ 		return nil, err
+@@ -243,6 +278,15 @@ func (c *Client) ReadPacket() (*Packet, error) {
  		Payload:  payload,
  	}
  
 +	// Parse channel from header for dual-channel cameras.
 +	// Primary: byte 28 (some cameras set this directly).
-+	if len(hdr) >= 29 {
-+		ch := hdr[28]
-+		if ch <= 1 {
-+			pkt.Channel = ch
-+			pkt.ChannelOK = true
-+		}
-+	}
++	pkt.Channel = hdr[28]
++	pkt.ChannelOK = pkt.Channel <= 1
 +
 +	// Secondary: high byte of flags field (flags >> 24).
 +	// Some cameras encode channel here instead of in byte 28.
@@ -1399,7 +1410,7 @@ index 3113632a1cd7521a038c564c08a3af6342be2d80..96d864cab4b94cf02ceef73f052bcbda
  	switch c.model {
  	case ModelDafang, ModelXiaofang, ModelLoockV2:
  		// Dafang has ts in sec
-@@ -272,10 +311,13 @@ func (c *Client) WriteAudio(codecID uint32, payload []byte) error {
+@@ -272,10 +316,13 @@ func (c *Client) WriteAudio(codecID uint32, payload []byte) error {
  
  type Packet struct {
  	//Length    uint32
@@ -1418,20 +1429,24 @@ index 3113632a1cd7521a038c564c08a3af6342be2d80..96d864cab4b94cf02ceef73f052bcbda
  	//Reserved uint32
  	Payload []byte
 diff --git a/pkg/xiaomi/miss/producer.go b/pkg/xiaomi/miss/producer.go
-index a98808dd198240284a6c3b9848bedc52b224363d..c30762e2762ec38f6241fb37b4c06e3a32244f5b 100644
+index a98808dd198240284a6c3b9848bedc52b224363d..0c2646ba0924f71945502be065e4ac56c314a5b5 100644
 --- a/pkg/xiaomi/miss/producer.go
 +++ b/pkg/xiaomi/miss/producer.go
-@@ -3,38 +3,53 @@ package miss
+@@ -1,40 +1,60 @@
+ package miss
+ 
  import (
++	"errors"
  	"fmt"
  	"net/url"
++	"os"
 +	"strconv"
 +	"strings"
  	"time"
  
  	"github.com/AlexxIT/go2rtc/pkg/core"
  	"github.com/AlexxIT/go2rtc/pkg/h264"
- 	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
+-	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
  	"github.com/AlexxIT/go2rtc/pkg/h265"
 +	"github.com/AlexxIT/go2rtc/pkg/pcm"
  	"github.com/pion/rtp"
@@ -1460,30 +1475,34 @@ index a98808dd198240284a6c3b9848bedc52b224363d..c30762e2762ec38f6241fb37b4c06e3a
 +	if err != nil {
 +		return nil, err
 +	}
-+
-+	audio := parseAudioMode(query.Get("audio"))
-+	sess, st, err := defaultSessionManager.acquire(rawURL, channel, audio)
-+	if err != nil {
-+		return nil, err
-+	}
  
 -	err = client.StartMedia(query.Get("channel"), query.Get("subtype"), query.Get("audio"))
-+	err = sess.startMedia(channel, query.Get("subtype"), query.Get("audio"))
++	audio := parseAudioMode(query.Get("audio"))
++	sess, st, err := defaultSessionManager.acquire(u, channel, audio)
  	if err != nil {
 -		_ = client.Close()
-+		_ = st.Close()
  		return nil, err
  	}
  
 -	medias, err := probe(client, query.Get("audio") != "0")
-+	medias, err := probe(st, audio.enabled(), backchannel)
++	quality := query.Get("subtype")
++	if !sess.client.IsDafangLike() {
++		quality = normalizeQuality(query.Get("model"), quality)
++	}
++	err = sess.startMedia(channel, quality)
  	if err != nil {
 -		_ = client.Close()
 +		_ = st.Close()
++		return nil, err
++	}
++
++	medias, err := probe(st, audio.enabled(), backchannel)
++	if err != nil {
++		sess.removeStream(st, errors.Is(err, os.ErrDeadlineExceeded))
  		return nil, err
  	}
  
-@@ -42,32 +57,62 @@ func Dial(rawURL string) (core.Producer, error) {
+@@ -42,64 +62,90 @@ func Dial(rawURL string) (core.Producer, error) {
  		Connection: core.Connection{
  			ID:         core.NewID(),
  			FormatName: "xiaomi/miss",
@@ -1491,7 +1510,7 @@ index a98808dd198240284a6c3b9848bedc52b224363d..c30762e2762ec38f6241fb37b4c06e3a
 -			RemoteAddr: client.RemoteAddr().String(),
 -			UserAgent:  client.Version(),
 +			Protocol:   sess.client.Protocol(),
-+			RemoteAddr: st.RemoteAddr().String(),
++			RemoteAddr: sess.client.RemoteAddr().String(),
 +			UserAgent:  sess.client.Version(),
  			Medias:     medias,
 -			Transport:  client,
@@ -1508,14 +1527,17 @@ index a98808dd198240284a6c3b9848bedc52b224363d..c30762e2762ec38f6241fb37b4c06e3a
 +	if fragment == "" {
 +		return true, nil
 +	}
-+
+ 
+-	var vcodec, acodec *core.Codec
 +	query, err := url.ParseQuery(strings.ReplaceAll(fragment, "#", "&"))
 +	if err != nil {
 +		return false, fmt.Errorf("xiaomi: invalid source options: %w", err)
 +	}
 +	return query.Get("backchannel") != "0", nil
 +}
-+
+ 
+-	for {
+-		pkt, err := client.ReadPacket()
 +func parseChannel(query url.Values) (uint8, error) {
 +	raw := query.Get("channel")
 +	switch raw {
@@ -1528,72 +1550,88 @@ index a98808dd198240284a6c3b9848bedc52b224363d..c30762e2762ec38f6241fb37b4c06e3a
 +}
 +
 +func probe(st *stream, audio, backchannel bool) ([]*core.Media, error) {
-+	_ = st.SetDeadline(time.Now().Add(15 * time.Second))
- 
- 	var vcodec, acodec *core.Codec
- 
- 	for {
--		pkt, err := client.ReadPacket()
-+		pkt, err := st.ReadPacket()
++	deadline := time.Now().Add(15 * time.Second)
++	var vcodec, acodec *core.Codec
++	if audio {
++		acodec = st.session.cachedAudioCodec()
++	}
++	for vcodec == nil || (audio && acodec == nil) {
++		pkt, err := st.readPacket(deadline)
  		if err != nil {
-+			// If we got video but timed out waiting for audio, that's OK
-+			// for dual-channel where audio may only go to one stream.
- 			if vcodec != nil {
+-			if vcodec != nil {
 -				err = fmt.Errorf("no audio")
 -			} else if acodec != nil {
+-				err = fmt.Errorf("no video")
++			if vcodec != nil && errors.Is(err, os.ErrDeadlineExceeded) {
 +				break
-+			}
-+			if acodec != nil {
- 				err = fmt.Errorf("no video")
  			}
  			return nil, fmt.Errorf("xiaomi: probe: %w", err)
  		}
- 
-+		if audio && acodec == nil {
-+			acodec = st.session.rememberAudioCodec(audioCodecFromPacket(pkt))
-+		}
-+
+-
  		switch pkt.CodecID {
- 		case codecH264:
- 			if vcodec == nil {
-@@ -83,22 +128,26 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
- 					vcodec = h265.AVCCToCodec(buf)
- 				}
+-		case codecH264:
+-			if vcodec == nil {
+-				buf := annexb.EncodeToAVCC(pkt.Payload)
+-				if h264.NALUType(buf) == h264.NALUTypeSPS {
+-					vcodec = h264.AVCCToCodec(buf)
+-				}
++		case codecH264, codecH265:
++			if vcodec != nil {
++				continue
+ 			}
+-		case codecH265:
+-			if vcodec == nil {
+-				buf := annexb.EncodeToAVCC(pkt.Payload)
+-				if h265.NALUType(buf) == h265.NALUTypeVPS {
+-					vcodec = h265.AVCCToCodec(buf)
+-				}
++			buf := pkt.videoAVCC()
++			if len(buf) == 0 {
++				continue
  			}
 -		case codecPCMA:
 -			if acodec == nil {
 -				acodec = &core.Codec{Name: core.CodecPCMA, ClockRate: pkt.SampleRate()}
--			}
++			switch {
++			case pkt.CodecID == codecH264 && h264.NALUType(buf) == h264.NALUTypeSPS:
++				vcodec = h264.AVCCToCodec(buf)
++			case pkt.CodecID == codecH265 && h265.NALUType(buf) == h265.NALUTypeVPS:
++				vcodec = h265.AVCCToCodec(buf)
++			default:
++				continue
+ 			}
 -		case codecOPUS:
 -			if acodec == nil {
 -				acodec = &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
--			}
++			// RTSP DESCRIBE waits for this probe even when the camera sends only video.
++			if audioDeadline := time.Now().Add(time.Second); audioDeadline.Before(deadline) {
++				deadline = audioDeadline
++			}
++		default:
++			if audio && acodec == nil {
++				acodec = audioCodecFromPacket(pkt)
+ 			}
  		}
- 
+-
 -		if vcodec != nil && (acodec != nil || !audio) {
-+		if vcodec != nil {
- 			break
+-			break
++	}
++	var talkCodec *core.Codec
++	if audio {
++		if acodec == nil {
++			acodec = &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
++		}
++		if backchannel {
++			talkCodec = st.session.talkCodec()
  		}
  	}
  
 -	_ = client.SetDeadline(time.Time{})
-+	_ = st.SetDeadline(time.Time{})
-+
-+	var talkCodec *core.Codec
-+	if audio {
-+		if acodec == nil {
-+			if acodec = st.session.cachedAudioCodec(); acodec == nil {
-+				acodec = st.session.defaultAudioCodec()
-+			}
-+		}
-+		if backchannel {
-+			talkCodec = st.session.talkCodec()
-+		}
-+	}
- 
+-
  	medias := []*core.Media{
  		{
-@@ -114,29 +163,41 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
+ 			Kind:      core.KindVideo,
+@@ -114,91 +160,130 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
  			Direction: core.DirectionRecvonly,
  			Codecs:    []*core.Codec{acodec},
  		})
@@ -1630,119 +1668,119 @@ index a98808dd198240284a6c3b9848bedc52b224363d..c30762e2762ec38f6241fb37b4c06e3a
  func (p *Producer) Start() error {
  	var audioTS uint32
  
++	deadline := time.Now().Add(mediaTimeout)
  	for {
 -		_ = p.client.SetDeadline(time.Now().Add(10 * time.Second))
 -		pkt, err := p.client.ReadPacket()
-+		pkt, err := p.stream.ReadPacket()
++		pkt, err := p.stream.readPacket(deadline)
  		if err != nil {
 -			// Free the camera slot now: streams stops this producer only after
 -			// the reconnect succeeds, and the reconnect may need that slot.
 -			_ = p.client.Close()
++			// streams reconnects before it stops the old producer.
++			p.stream.session.removeStream(p.stream, errors.Is(err, os.ErrDeadlineExceeded))
  			return err
  		}
- 
-@@ -161,6 +222,7 @@ func (p *Producer) Start() error {
+-
+ 		p.Recv += len(pkt.Payload)
+-
+-		// TODO: rewrite this
++		out := &core.Packet{Header: rtp.Header{SequenceNumber: uint16(pkt.Sequence)}, Payload: pkt.Payload}
+ 		var name string
+-		var pkt2 *core.Packet
+-
+ 		switch pkt.CodecID {
+ 		case codecH264, codecH265:
+-			pkt2 = &core.Packet{
+-				Header: rtp.Header{
+-					SequenceNumber: uint16(pkt.Sequence),
+-					Timestamp:      TimeToRTP(pkt.Timestamp, 90000),
+-				},
+-				Payload: annexb.EncodeToAVCC(pkt.Payload),
++			out.Payload = pkt.videoAVCC()
++			if len(out.Payload) == 0 {
++				continue
+ 			}
+-			if pkt.CodecID == codecH264 {
+-				name = core.CodecH264
+-			} else {
++			deadline = time.Now().Add(mediaTimeout)
++			out.Timestamp = TimeToRTP(pkt.Timestamp, 90000)
++			name = core.CodecH264
++			if pkt.CodecID == codecH265 {
  				name = core.CodecH265
  			}
- 		case codecPCMA:
-+			p.stream.session.rememberAudioCodec(audioCodecFromPacket(pkt))
- 			name = core.CodecPCMA
- 			pkt2 = &core.Packet{
- 				Header: rtp.Header{
-@@ -172,7 +234,34 @@ func (p *Producer) Start() error {
- 				Payload: pkt.Payload,
+-		case codecPCMA:
+-			name = core.CodecPCMA
+-			pkt2 = &core.Packet{
+-				Header: rtp.Header{
+-					Version:        2,
+-					Marker:         true,
+-					SequenceNumber: uint16(pkt.Sequence),
+-					Timestamp:      audioTS,
+-				},
+-				Payload: pkt.Payload,
++		default:
++			codec := audioCodecFromPacket(pkt)
++			if codec == nil {
++				continue
  			}
- 			audioTS += uint32(len(pkt.Payload))
-+		case codecPCMU:
-+			p.stream.session.rememberAudioCodec(audioCodecFromPacket(pkt))
-+			name = core.CodecPCMU
-+			pkt2 = &core.Packet{
-+				Header: rtp.Header{
-+					Version:        2,
-+					Marker:         true,
-+					SequenceNumber: uint16(pkt.Sequence),
-+					Timestamp:      audioTS,
-+				},
-+				Payload: pkt.Payload,
-+			}
-+			audioTS += uint32(len(pkt.Payload))
-+		case codecPCM:
-+			p.stream.session.rememberAudioCodec(audioCodecFromPacket(pkt))
-+			name = core.CodecPCML
-+			pkt2 = &core.Packet{
-+				Header: rtp.Header{
-+					Version:        2,
-+					Marker:         true,
-+					SequenceNumber: uint16(pkt.Sequence),
-+					Timestamp:      audioTS,
-+				},
-+				Payload: pkt.Payload,
-+			}
-+			audioTS += uint32(len(pkt.Payload) / 2)
- 		case codecOPUS:
-+			p.stream.session.rememberAudioCodec(audioCodecFromPacket(pkt))
- 			name = core.CodecOpus
- 			pkt2 = &core.Packet{
- 				Header: rtp.Header{
-@@ -187,17 +276,86 @@ func (p *Producer) Start() error {
- 			audioTS += timestamp40ms
+-			audioTS += uint32(len(pkt.Payload))
+-		case codecOPUS:
+-			name = core.CodecOpus
+-			pkt2 = &core.Packet{
+-				Header: rtp.Header{
+-					Version:        2,
+-					Marker:         true,
+-					SequenceNumber: uint16(pkt.Sequence),
+-					Timestamp:      audioTS,
+-				},
+-				Payload: pkt.Payload,
++			name = codec.Name
++			out.Version, out.Marker, out.Timestamp = 2, true, audioTS
++			switch pkt.CodecID {
++			case codecPCM:
++				audioTS += uint32(len(pkt.Payload) / 2)
++			case codecOPUS:
++				audioTS += timestamp40ms
++			default:
++				audioTS += uint32(len(pkt.Payload))
+ 			}
+-			// known cameras sends packets with 40ms long
+-			audioTS += timestamp40ms
  		}
- 
--		for _, recv := range p.Receivers {
--			if recv.Codec.Name == name {
--				recv.WriteRTP(pkt2)
--				break
--			}
-+		if pkt2 == nil {
-+			continue
- 		}
-+
-+		if p.writePacket(name, pkt2, pkt.SampleRate()) {
-+			continue
-+		}
++		p.writePacket(name, out, pkt.SampleRate())
 +	}
 +}
-+
-+func (p *Producer) writePacket(name string, pkt *core.Packet, sampleRate uint32) bool {
+ 
++func (p *Producer) writePacket(name string, pkt *core.Packet, sampleRate uint32) {
 +	for _, recv := range p.Receivers {
 +		if matchesPacketCodec(recv.Codec, name, sampleRate) {
 +			recv.WriteRTP(pkt)
-+			return true
++			return
 +		}
 +	}
-+
-+	if !isPCMCodecName(name) {
-+		return false
-+	}
-+
-+	for _, recv := range p.Receivers {
-+		if !isPCMCodecName(recv.Codec.Name) {
-+			continue
-+		}
-+		converted := transcodePCMPacket(pkt, name, recv.Codec, sampleRate)
-+		if converted == nil {
-+			continue
-+		}
-+		recv.WriteRTP(converted)
-+		return true
-+	}
-+
-+	return false
-+}
-+
++	if isPCMCodecName(name) {
+ 		for _, recv := range p.Receivers {
+-			if recv.Codec.Name == name {
+-				recv.WriteRTP(pkt2)
+-				break
++			if isPCMCodecName(recv.Codec.Name) {
++				recv.WriteRTP(transcodePCMPacket(pkt, name, recv.Codec, sampleRate))
++				return
+ 			}
+ 		}
+ 	}
+ }
+ 
+-func (p *Producer) Stop() error {
+-	_ = p.client.StopMedia()
+-	return p.Connection.Stop()
 +func transcodePCMPacket(pkt *core.Packet, srcName string, dst *core.Codec, sampleRate uint32) *core.Packet {
-+	if sampleRate == 0 {
-+		sampleRate = 8000
-+	}
-+
 +	dstCodec := dst.Clone()
 +	if dstCodec.ClockRate == 0 {
 +		dstCodec.ClockRate = sampleRate
 +	}
-+	if dstCodec.Name == srcName && dstCodec.ClockRate == sampleRate {
-+		return pkt
-+	}
-+
 +	srcCodec := &core.Codec{Name: srcName, ClockRate: sampleRate}
 +	payload := pcm.Transcode(dstCodec, srcCodec)(pkt.Payload)
 +
@@ -1758,7 +1796,7 @@ index a98808dd198240284a6c3b9848bedc52b224363d..c30762e2762ec38f6241fb37b4c06e3a
 +	if codec.Name != name {
 +		return false
 +	}
-+	if !isPCMCodecName(name) || sampleRate == 0 {
++	if !isPCMCodecName(name) {
 +		return true
 +	}
 +	return codec.ClockRate == 0 || codec.ClockRate == sampleRate
@@ -1768,27 +1806,25 @@ index a98808dd198240284a6c3b9848bedc52b224363d..c30762e2762ec38f6241fb37b4c06e3a
 +	switch name {
 +	case core.CodecPCMA, core.CodecPCMU, core.CodecPCM, core.CodecPCML:
 +		return true
- 	}
++	}
 +	return false
  }
  
- func (p *Producer) Stop() error {
--	_ = p.client.StopMedia()
- 	return p.Connection.Stop()
- }
- 
+ // TimeToRTP convert time in milliseconds to RTP time
 diff --git a/pkg/xiaomi/miss/producer_test.go b/pkg/xiaomi/miss/producer_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..511a45b0d7af09f5cf3056a6713996caed3d3c0b
+index 0000000000000000000000000000000000000000..8084ebf5d03684be55decdaa5730cede8a91f1b4
 --- /dev/null
 +++ b/pkg/xiaomi/miss/producer_test.go
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,390 @@
 +package miss
 +
 +import (
 +	"encoding/hex"
 +	"io"
++	"os"
 +	"testing"
++	"testing/synctest"
 +	"time"
 +
 +	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -1797,47 +1833,61 @@ index 0000000000000000000000000000000000000000..511a45b0d7af09f5cf3056a6713996ca
 +)
 +
 +func TestProbeAddsDefaultSharedAudioMedia(t *testing.T) {
-+	s := newSession(newFakeClient(), "key", nil)
-+	st := newTestStream(s)
-+	st.ch <- testH264Packet(t)
++	synctest.Test(t, func(t *testing.T) {
++		s := newSession(newFakeClient(), "key", nil)
++		st := newTestStream(s)
++		video := testH264Packet(t)
++		st.ch <- video
++		time.AfterFunc(500*time.Millisecond, func() { st.ch <- video })
 +
-+	medias, err := probe(st, true, true)
-+	require.NoError(t, err)
-+	require.Len(t, medias, 3)
-+	require.Equal(t, core.KindVideo, medias[0].Kind)
-+	require.Equal(t, core.KindAudio, medias[1].Kind)
-+	require.Equal(t, core.DirectionRecvonly, medias[1].Direction)
-+	require.Equal(t, core.CodecPCMA, medias[1].Codecs[0].Name)
-+	require.Equal(t, core.KindAudio, medias[2].Kind)
-+	require.Equal(t, core.DirectionSendonly, medias[2].Direction)
-+	require.Equal(t, core.CodecPCMA, medias[2].Codecs[0].Name)
++		start := time.Now()
++		medias, err := probe(st, true, true)
++		require.NoError(t, err)
++		require.Equal(t, time.Second, time.Since(start))
++		require.Len(t, medias, 3)
++		require.Equal(t, core.KindVideo, medias[0].Kind)
++		require.Equal(t, core.KindAudio, medias[1].Kind)
++		require.Equal(t, core.DirectionRecvonly, medias[1].Direction)
++		require.Equal(t, core.CodecPCMA, medias[1].Codecs[0].Name)
++		require.Equal(t, uint32(8000), medias[1].Codecs[0].ClockRate)
++		require.Equal(t, core.KindAudio, medias[2].Kind)
++		require.Equal(t, core.DirectionSendonly, medias[2].Direction)
++		require.Equal(t, core.CodecPCMA, medias[2].Codecs[0].Name)
++	})
 +}
 +
 +func TestProbeUsesPCMARecvDefaultForOpusTalk(t *testing.T) {
-+	client := newFakeClient()
-+	client.speakerCodec = codecOPUS
-+	s := newSession(client, "key", nil)
-+	st := newTestStream(s)
-+	st.ch <- testH264Packet(t)
++	synctest.Test(t, func(t *testing.T) {
++		client := newFakeClient()
++		client.speakerCodec = codecOPUS
++		s := newSession(client, "key", nil)
++		st := newTestStream(s)
++		video := testH264Packet(t)
++		time.AfterFunc(14500*time.Millisecond, func() { st.ch <- video })
 +
-+	medias, err := probe(st, true, true)
-+	require.NoError(t, err)
-+	require.Len(t, medias, 3)
-+	require.Equal(t, core.CodecPCMA, medias[1].Codecs[0].Name)
-+	require.Equal(t, core.CodecOpus, medias[2].Codecs[0].Name)
++		start := time.Now()
++		medias, err := probe(st, true, true)
++		require.NoError(t, err)
++		require.Equal(t, 15*time.Second, time.Since(start))
++		require.Len(t, medias, 3)
++		require.Equal(t, core.CodecPCMA, medias[1].Codecs[0].Name)
++		require.Equal(t, core.CodecOpus, medias[2].Codecs[0].Name)
++	})
 +}
 +
 +func TestProbeDisablesBackchannelButKeepsReceiveAudio(t *testing.T) {
-+	s := newSession(newFakeClient(), "key", nil)
-+	st := newTestStream(s)
-+	st.ch <- testH264Packet(t)
++	synctest.Test(t, func(t *testing.T) {
++		s := newSession(newFakeClient(), "key", nil)
++		st := newTestStream(s)
++		st.ch <- testH264Packet(t)
 +
-+	medias, err := probe(st, true, false)
-+	require.NoError(t, err)
-+	require.Len(t, medias, 2)
-+	require.Equal(t, core.KindVideo, medias[0].Kind)
-+	require.Equal(t, core.KindAudio, medias[1].Kind)
-+	require.Equal(t, core.DirectionRecvonly, medias[1].Direction)
++		medias, err := probe(st, true, false)
++		require.NoError(t, err)
++		require.Len(t, medias, 2)
++		require.Equal(t, core.KindVideo, medias[0].Kind)
++		require.Equal(t, core.KindAudio, medias[1].Kind)
++		require.Equal(t, core.DirectionRecvonly, medias[1].Direction)
++	})
 +}
 +
 +func TestParseBackchannel(t *testing.T) {
@@ -1875,11 +1925,13 @@ index 0000000000000000000000000000000000000000..511a45b0d7af09f5cf3056a6713996ca
 +func TestProbeReusesObservedSharedAudioCodec(t *testing.T) {
 +	s := newSession(newFakeClient(), "key", nil)
 +	st0 := newTestStream(s)
-+	st0.ch <- &Packet{
++	audioPacket := &Packet{
 +		CodecID: codecPCMU,
 +		Flags:   1 << 3,
 +		Payload: []byte{1, 2, 3, 4},
 +	}
++	s.dispatch(audioPacket)
++	st0.ch <- audioPacket
 +	st0.ch <- testH264Packet(t)
 +
 +	medias0, err := probe(st0, true, true)
@@ -2014,7 +2066,7 @@ index 0000000000000000000000000000000000000000..511a45b0d7af09f5cf3056a6713996ca
 +		ch:      make(chan *Packet, 10),
 +		done:    make(chan struct{}),
 +	}
-+	st.deadline.Store(time.Time{})
++
 +	return st
 +}
 +
@@ -2023,7 +2075,7 @@ index 0000000000000000000000000000000000000000..511a45b0d7af09f5cf3056a6713996ca
 +		for len(st.ch) > 0 {
 +			time.Sleep(time.Millisecond)
 +		}
-+		st.close()
++		close(st.done)
 +	}()
 +}
 +
@@ -2038,21 +2090,138 @@ index 0000000000000000000000000000000000000000..511a45b0d7af09f5cf3056a6713996ca
 +		Payload: annexb.DecodeAVCC(avcc, true),
 +	}
 +}
++
++func TestProbeNegotiatesVideoThenOpus(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		s := newSession(newFakeClient(), "", nil)
++		st := newTestStream(s)
++		st.ch <- testH264Packet(t)
++		audio := &Packet{CodecID: codecOPUS, Payload: []byte{0xf8, 0xff, 0xfe}}
++		time.AfterFunc(500*time.Millisecond, func() { st.ch <- audio })
++		start := time.Now()
++		medias, err := probe(st, true, false)
++		require.NoError(t, err)
++		require.Equal(t, 500*time.Millisecond, time.Since(start))
++		require.Len(t, medias, 2)
++		require.Equal(t, core.CodecOpus, medias[1].Codecs[0].Name)
++		recv := core.NewReceiver(medias[1], medias[1].Codecs[0])
++		p := &Producer{Connection: core.Connection{Receivers: []*core.Receiver{recv}}, stream: st}
++		st.ch <- audio
++		closeWhenDrained(st)
++		require.ErrorIs(t, p.Start(), io.EOF)
++		require.Equal(t, 1, recv.Packets)
++	})
++}
++
++func TestDialSharesBothLensesAndDuplicateReader(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		client := newFakeClient()
++		client.media = make(chan *Packet, 4)
++		dials := 0
++		old := defaultSessionManager
++		defer func() { defaultSessionManager = old }()
++		defaultSessionManager = newSessionManager(func(string) (sessionClient, error) {
++			dials++
++			return client, nil
++		})
++		open := func(options string, pkt *Packet, codec string) (core.Producer, *core.Receiver) {
++			t.Helper()
++			go func() {
++				synctest.Wait()
++				client.media <- pkt
++			}()
++			p, err := Dial("xiaomi://camera?model=" + ModelC300 + "&audio=0&" + options + "#backchannel=0")
++			require.NoError(t, err)
++			medias := p.GetMedias()
++			require.Len(t, medias, 1)
++			require.Equal(t, codec, medias[0].Codecs[0].Name)
++			r, err := p.GetTrack(medias[0], medias[0].Codecs[0])
++			require.NoError(t, err)
++			return p, r
++		}
++		secondary := testH264Packet(t)
++		secondary.Channel, secondary.ChannelOK = 1, true
++		a, ar := open("channel=1&subtype=hd", secondary, core.CodecH264)
++		b, br := open("channel=1&subtype=3", secondary, core.CodecH264)
++		vps, err := hex.DecodeString("0000000140010c01ffff016000000300900000030000030078959809")
++		require.NoError(t, err)
++		primary := &Packet{CodecID: codecH265, ChannelOK: true, Payload: vps}
++		c, cr := open("channel=0&subtype=sd", primary, core.CodecH265)
++		done := make(chan error, 3)
++		for _, p := range []core.Producer{a, b, c} {
++			go func() { done <- p.Start() }()
++		}
++		synctest.Wait()
++		beforeA, beforeB := ar.Packets, br.Packets
++		client.media <- secondary
++		client.media <- primary
++		synctest.Wait()
++		require.Equal(t, beforeA+1, ar.Packets)
++		require.Equal(t, beforeB+1, br.Packets)
++		require.Equal(t, 1, cr.Packets)
++		require.Equal(t, 1, dials)
++		_, _, dual, singles := client.counts()
++		require.Equal(t, []string{"1"}, singles)
++		require.Equal(t, 1, dual)
++		for _, p := range []core.Producer{a, b, c} {
++			require.NoError(t, p.Stop())
++		}
++		for range 3 {
++			require.ErrorIs(t, <-done, io.EOF)
++		}
++	})
++}
++
++func TestSessionVideoTimeoutKeepsPeer(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		client := newFakeClient()
++		m := newSessionManager(func(string) (sessionClient, error) { return client, nil })
++		u := testURL(t, "xiaomi://host")
++		s, a, err := m.acquire(u, 0, audioVideoStart)
++		require.NoError(t, err)
++		require.NoError(t, s.startMedia(0, "hd"))
++		_, b, err := m.acquire(u, 1, audioVideoStart)
++		require.NoError(t, err)
++		require.NoError(t, s.startMedia(1, "hd"))
++		result := make(chan error, 1)
++		go func() { p := Producer{stream: b}; result <- p.Start() }()
++		synctest.Wait()
++		video := testH264Packet(t)
++		video.ChannelOK = true
++		s.dispatch(video)
++		for range 11 {
++			s.dispatch(&Packet{CodecID: codecPCMA})
++			s.dispatch(video)
++			time.Sleep(time.Second)
++		}
++		require.ErrorIs(t, <-result, os.ErrDeadlineExceeded)
++		stop, closed, _, _ := client.counts()
++		require.Zero(t, stop)
++		require.Zero(t, closed)
++		_, replacement, err := m.acquire(u, 1, audioDisabled)
++		require.NoError(t, err)
++		require.NoError(t, s.startMedia(1, "hd"))
++		_, _, dual, _ := client.counts()
++		require.Equal(t, 2, dual)
++		require.NoError(t, replacement.Close())
++		require.NoError(t, a.Close())
++	})
++}
 diff --git a/pkg/xiaomi/miss/session.go b/pkg/xiaomi/miss/session.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc80a90e75
+index 0000000000000000000000000000000000000000..568aa99a821755d6ea0f5dc6368872b51607e4e2
 --- /dev/null
 +++ b/pkg/xiaomi/miss/session.go
-@@ -0,0 +1,684 @@
+@@ -0,0 +1,401 @@
 +package miss
 +
 +import (
 +	"errors"
 +	"io"
 +	"net"
-+	"net/url"
++	"os"
++	"strconv"
 +	"sync"
-+	"sync/atomic"
 +	"time"
 +
 +	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -2064,26 +2233,23 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +// limited connection slots.
 +type session struct {
 +	client  sessionClient
-+	key     string // cache key: host|did
++	key     string // physical endpoint
++	scope   [32]byte
 +	manager *sessionManager
-+
 +	mu      sync.Mutex
-+	streams map[*stream]struct{}
-+	state   sessionState
-+	reason  shutdownReason
++	streams map[*stream]struct{} // nil once shutdown owns the client
 +
 +	// startedMask tracks which channels have been started (bit 0 = ch0, bit 1 = ch1).
 +	startedMask  uint8
 +	restartMask  uint8
-+	quality      [2]string // remembered quality per channel
++	quality      [2]string // configured while the channel has readers
 +	mediaAudio   bool
 +	audioStarted bool
 +
-+	workerOnce sync.Once
 +	workerDone chan struct{}
 +
-+	speakerOnce sync.Once
-+	speakerErr  error
++	speakerStarted bool
++	audioWriteMu   sync.Mutex // shared transport assigns one outgoing audio sequence
 +
 +	audioCodec *core.Codec
 +	classifier *packetClassifier
@@ -2098,9 +2264,7 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +	audio   audioMode
 +	ch      chan *Packet
 +
-+	closeOnce sync.Once
-+	deadline  atomic.Value // time.Time
-+	done      chan struct{}
++	done chan struct{}
 +}
 +
 +type sessionClient interface {
@@ -2120,22 +2284,8 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +	Close() error
 +}
 +
-+type sessionState uint8
-+
 +const (
-+	sessionActive sessionState = iota
-+	sessionClosing
-+	sessionClosed
-+)
-+
-+type shutdownReason uint8
-+
-+const (
-+	shutdownReadError shutdownReason = iota
-+	shutdownNoStreams
-+)
-+
-+const (
++	mediaTimeout      = 10 * time.Second
 +	stopMediaTimeout  = time.Second
 +	workerStopTimeout = time.Second
 +)
@@ -2165,27 +2315,12 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +	return m != audioDisabled
 +}
 +
-+// sessionKey builds a cache key from the URL. Two URLs pointing to the same
-+// camera (same host and did) will share a session.
-+func sessionKey(rawURL string) (string, error) {
-+	u, err := url.Parse(rawURL)
-+	if err != nil {
-+		return "", err
-+	}
-+	key := u.Host
-+	if did := u.Query().Get("did"); did != "" {
-+		key += "|" + did
-+	}
-+	return key, nil
-+}
-+
 +func newSession(client sessionClient, key string, manager *sessionManager) *session {
 +	return &session{
 +		client:     client,
 +		key:        key,
 +		manager:    manager,
 +		streams:    make(map[*stream]struct{}),
-+		state:      sessionActive,
 +		workerDone: make(chan struct{}),
 +		classifier: newPacketClassifier(),
 +	}
@@ -2194,19 +2329,12 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +// openStream creates a new stream for the given channel on this session.
 +func (s *session) openStream(channel uint8, audio audioMode) (*stream, error) {
 +	s.mu.Lock()
-+	st, err := s.openStreamLocked(channel, audio)
-+	s.mu.Unlock()
-+	if err != nil {
-+		return nil, err
-+	}
-+	s.startWorker()
-+	return st, nil
-+}
-+
-+// openStreamLocked creates a new stream while s.mu is held.
-+func (s *session) openStreamLocked(channel uint8, audio audioMode) (*stream, error) {
-+	if s.state != sessionActive {
++	defer s.mu.Unlock()
++	if s.streams == nil {
 +		return nil, errSessionClosing
++	}
++	if len(s.streams) == 0 {
++		go s.worker()
 +	}
 +
 +	st := &stream{
@@ -2216,190 +2344,59 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +		ch:      make(chan *Packet, 100),
 +		done:    make(chan struct{}),
 +	}
-+	st.deadline.Store(time.Time{})
 +
 +	s.streams[st] = struct{}{}
 +	return st, nil
 +}
 +
-+func (s *session) startWorker() {
-+	s.workerOnce.Do(func() {
-+		go s.worker()
-+	})
-+}
-+
 +// startMedia sends the appropriate VideoStart command. If only one channel is
 +// active, it sends a single-channel command. If both channels are active, it
 +// sends a dual-channel command.
-+func (s *session) startMedia(channel uint8, quality, _ string) error {
++func (s *session) startMedia(channel uint8, quality string) error {
 +	s.mu.Lock()
 +	defer s.mu.Unlock()
-+
-+	ch := int(channel)
-+	if ch > 1 {
-+		ch = 0
++	if s.streams == nil {
++		return errSessionClosing
 +	}
-+
-+	bit := channelBit(uint8(ch))
-+
-+	// Already started this channel.
-+	if s.startedMask&bit != 0 {
-+		if s.restartMask&bit != 0 {
-+			s.quality[ch] = quality
-+			return s.restartMediaLocked(uint8(ch))
-+		}
-+		if !s.mediaAudio && s.audioEnabledLocked() {
-+			return s.enableAudioLocked()
-+		}
-+		if s.shouldStartAudioLocked() {
-+			s.startAudioLocked()
-+		}
-+		return nil
++	bit := uint8(1 << channel)
++	if s.quality[channel] != "" && s.quality[channel] != quality {
++		return errors.New("miss: conflicting quality on active channel")
 +	}
-+
-+	s.quality[ch] = quality
-+	other := ch ^ 1
-+	audio := s.audioParamLocked()
-+
-+	// If the other channel is already started, upgrade to dual-channel.
-+	if s.startedMask&(1<<other) != 0 {
-+		err := s.client.StartMediaDual(
-+			s.quality[0], s.quality[1], audio,
-+		)
++	var audio audioMode
++	for st := range s.streams {
++		audio = max(audio, st.audio)
++	}
++	if s.quality[channel] == "" || s.restartMask&bit != 0 || (audio.enabled() && !s.mediaAudio) {
++		qualities := s.quality
++		qualities[channel] = quality
++		mask := bit
++		if qualities[1-channel] != "" {
++			mask = 3
++		}
++		enableAudio := "0"
++		if audio.enabled() {
++			enableAudio = "1"
++		}
++		var err error
++		if mask == 3 {
++			err = s.client.StartMediaDual(qualities[0], qualities[1], enableAudio)
++		} else {
++			err = s.client.StartMedia(strconv.Itoa(int(channel)), quality, enableAudio)
++		}
 +		if err != nil {
 +			return err
 +		}
-+		s.startedMask |= 1 << ch
-+		s.mediaAudio = audio != "0"
-+		if s.shouldStartAudioLocked() {
-+			s.startAudioLocked()
-+		}
-+		return nil
++		s.quality = qualities
++		s.startedMask = mask
++		s.restartMask &^= mask
++		s.mediaAudio = audio.enabled()
++		s.audioStarted = false
 +	}
-+
-+	// Single channel start.
-+	chStr := "0"
-+	if channel == 1 {
-+		chStr = "1"
-+	}
-+	if err := s.client.StartMedia(chStr, quality, audio); err != nil {
-+		return err
-+	}
-+	s.startedMask |= 1 << ch
-+	s.mediaAudio = audio != "0"
-+	if s.shouldStartAudioLocked() {
-+		s.startAudioLocked()
++	if !s.audioStarted && audio.enabled() && !s.client.IsDafangLike() && (s.startedMask == 3 || audio == audioCommandStart) {
++		// Video can still be used after an optional audio command fails.
++		s.audioStarted = s.client.StartAudio() == nil
 +	}
 +	return nil
-+}
-+
-+func channelBit(channel uint8) uint8 {
-+	if channel == 1 {
-+		return 0b10
-+	}
-+	return 0b01
-+}
-+
-+func (s *session) restartMediaLocked(channel uint8) error {
-+	bit := channelBit(channel)
-+	other := channel ^ 1
-+	audio := s.audioParamLocked()
-+
-+	var err error
-+	if s.startedMask&channelBit(other) != 0 && s.hasChannelLocked(other) {
-+		err = s.client.StartMediaDual(s.quality[0], s.quality[1], audio)
-+	} else {
-+		err = s.client.StartMedia(channelString(channel), s.quality[channel], audio)
-+	}
-+	if err != nil {
-+		return err
-+	}
-+
-+	s.restartMask &^= bit
-+	s.mediaAudio = audio != "0"
-+	s.audioStarted = false
-+	if s.shouldStartAudioLocked() {
-+		s.startAudioLocked()
-+	}
-+	return nil
-+}
-+
-+func (s *session) audioEnabledLocked() bool {
-+	for st := range s.streams {
-+		if st.audio.enabled() {
-+			return true
-+		}
-+	}
-+	return false
-+}
-+
-+func (s *session) audioCommandEnabledLocked() bool {
-+	for st := range s.streams {
-+		if st.audio == audioCommandStart {
-+			return true
-+		}
-+	}
-+	return false
-+}
-+
-+func (s *session) hasChannelLocked(channel uint8) bool {
-+	for st := range s.streams {
-+		if st.channel == channel {
-+			return true
-+		}
-+	}
-+	return false
-+}
-+
-+func (s *session) audioParamLocked() string {
-+	if s.audioEnabledLocked() {
-+		return "1"
-+	}
-+	return "0"
-+}
-+
-+func (s *session) enableAudioLocked() error {
-+	if s.startedMask == 0 {
-+		return nil
-+	}
-+
-+	var err error
-+	if s.startedMask == 0b11 {
-+		err = s.client.StartMediaDual(s.quality[0], s.quality[1], "1")
-+	} else {
-+		ch := uint8(0)
-+		if s.startedMask&0b10 != 0 {
-+			ch = 1
-+		}
-+		err = s.client.StartMedia(channelString(ch), s.quality[ch], "1")
-+	}
-+	if err != nil {
-+		return err
-+	}
-+	s.mediaAudio = true
-+	if s.shouldStartAudioLocked() {
-+		s.startAudioLocked()
-+	}
-+	return nil
-+}
-+
-+func (s *session) shouldStartAudioLocked() bool {
-+	if s.audioStarted || s.client.IsDafangLike() || !s.audioEnabledLocked() {
-+		return false
-+	}
-+	return s.startedMask == 0b11 || s.audioCommandEnabledLocked()
-+}
-+
-+func (s *session) startAudioLocked() {
-+	_ = s.client.StartAudio()
-+	s.audioStarted = true
-+}
-+
-+func channelString(channel uint8) string {
-+	if channel == 1 {
-+		return "1"
-+	}
-+	return "0"
 +}
 +
 +// worker is the read loop that dispatches packets to streams.
@@ -2407,11 +2404,11 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +	defer close(s.workerDone)
 +
 +	for {
-+		_ = s.client.SetDeadline(time.Now().Add(10 * time.Second))
++		_ = s.client.SetDeadline(time.Now().Add(mediaTimeout))
 +
 +		pkt, err := s.client.ReadPacket()
 +		if err != nil {
-+			s.shutdown(shutdownReadError)
++			s.readFailed()
 +			return
 +		}
 +
@@ -2422,82 +2419,60 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +// dispatch routes a packet to the appropriate stream(s).
 +func (s *session) dispatch(pkt *Packet) {
 +	s.mu.Lock()
-+	if len(s.streams) == 0 {
-+		s.mu.Unlock()
-+		return
-+	}
-+
-+	streams := make([]*stream, 0, len(s.streams))
-+	for st := range s.streams {
-+		streams = append(streams, st)
-+	}
-+
-+	// Audio packets are broadcast to all streams.
++	defer s.mu.Unlock()
 +	if isAudioCodec(pkt.CodecID) {
-+		s.mu.Unlock()
-+		for _, st := range streams {
-+			st.push(pkt)
++		if s.audioCodec == nil {
++			s.audioCodec = audioCodecFromPacket(pkt)
++		}
++		for st := range s.streams {
++			if st.audio.enabled() {
++				st.push(pkt)
++			}
 +		}
 +		return
 +	}
-+
-+	// Single stream before dual mode: send all video to it, no classification needed.
-+	if len(streams) == 1 && s.startedMask != 0b11 {
-+		s.mu.Unlock()
-+		streams[0].push(pkt)
-+		return
-+	}
-+
-+	if len(streams) == 1 {
-+		ch, ok := s.classifier.ClassifyKnown(pkt)
-+		s.mu.Unlock()
-+		if !ok || streams[0].channel == ch {
-+			streams[0].push(pkt)
++	mask := s.startedMask
++	if mask == 3 {
++		// If the device is still sending both lenses after one unsubscribed,
++		// keep routing unknown packets to the remaining lens until we can classify.
++		var subscribed uint8
++		for st := range s.streams {
++			subscribed |= 1 << st.channel
 +		}
-+		return
++		if subscribed == 3 {
++			mask = 1 << s.classifier.Classify(pkt)
++		} else if ch, ok := s.classifier.ClassifyKnown(pkt); ok {
++			mask = 1 << ch
++		} else {
++			mask = subscribed
++		}
 +	}
-+
-+	// Multiple streams: classify and route. Already holding mu.
-+	ch := s.classifier.Classify(pkt)
-+	s.mu.Unlock()
-+
-+	for _, st := range streams {
-+		if st.channel == ch {
++	for st := range s.streams {
++		if mask&(1<<st.channel) != 0 {
 +			st.push(pkt)
 +		}
 +	}
 +}
 +
-+// startSpeaker starts the speaker on the session (once).
 +func (s *session) startSpeaker() error {
-+	s.speakerOnce.Do(func() {
-+		s.speakerErr = s.client.StartSpeaker()
-+	})
-+	return s.speakerErr
-+}
-+
-+// writeAudio sends audio data to the camera.
-+func (s *session) writeAudio(codecID uint32, payload []byte) error {
-+	return s.client.WriteAudio(codecID, payload)
-+}
-+
-+// speakerCodec returns the speaker codec for the camera model.
-+func (s *session) speakerCodec() uint32 {
-+	return s.client.SpeakerCodec()
-+}
-+
-+func (s *session) rememberAudioCodec(codec *core.Codec) *core.Codec {
-+	if codec == nil {
-+		return nil
-+	}
-+
 +	s.mu.Lock()
 +	defer s.mu.Unlock()
-+
-+	if s.audioCodec == nil {
-+		s.audioCodec = codec.Clone()
++	if s.streams == nil {
++		return errSessionClosing
 +	}
-+	return s.audioCodec.Clone()
++	if !s.speakerStarted {
++		if err := s.client.StartSpeaker(); err != nil {
++			return err
++		}
++		s.speakerStarted = true
++	}
++	return nil
++}
++
++func (s *session) writeAudio(codecID uint32, payload []byte) error {
++	s.audioWriteMu.Lock()
++	defer s.audioWriteMu.Unlock()
++	return s.client.WriteAudio(codecID, payload)
 +}
 +
 +func (s *session) cachedAudioCodec() *core.Codec {
@@ -2510,12 +2485,8 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +	return s.audioCodec.Clone()
 +}
 +
-+func (s *session) defaultAudioCodec() *core.Codec {
-+	return &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
-+}
-+
 +func (s *session) talkCodec() *core.Codec {
-+	switch s.speakerCodec() {
++	switch s.client.SpeakerCodec() {
 +	case codecOPUS:
 +		return &core.Codec{Name: core.CodecOpus, ClockRate: 48000, Channels: 2}
 +	default:
@@ -2525,89 +2496,60 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +
 +// removeStream removes a stream from the session. If no streams remain, the
 +// session is shut down.
-+func (s *session) removeStream(st *stream) {
-+	var shutdown bool
-+
++func (s *session) removeStream(st *stream, videoTimeout bool) {
 +	s.mu.Lock()
 +	if _, ok := s.streams[st]; !ok {
 +		s.mu.Unlock()
 +		return
 +	}
 +	delete(s.streams, st)
-+	if len(s.streams) == 0 && s.state == sessionActive {
-+		s.state = sessionClosing
-+		s.reason = shutdownNoStreams
-+		shutdown = true
-+	} else if s.state == sessionActive && !s.hasChannelLocked(st.channel) {
-+		s.restartMask |= channelBit(st.channel)
++	last := len(s.streams) == 0
++	if last {
++		s.streams = nil
++	} else if !s.hasChannelLocked(st.channel) {
++		s.quality[st.channel] = ""
++	} else if videoTimeout {
++		s.restartMask |= 1 << st.channel
 +	}
 +	s.mu.Unlock()
-+
-+	st.close()
-+
-+	if shutdown {
-+		s.completeShutdown(shutdownNoStreams, nil)
-+	}
-+}
-+
-+// shutdown tears down the session, closing all streams and the client.
-+func (s *session) shutdown(reason shutdownReason) {
-+	streams, ok := s.beginShutdown(reason)
-+	if !ok {
-+		return
-+	}
-+	s.completeShutdown(reason, streams)
-+}
-+
-+func (s *session) completeShutdown(reason shutdownReason, streams []*stream) {
-+	if s.manager != nil {
-+		s.manager.remove(s)
-+	}
-+
-+	if reason == shutdownNoStreams {
++	if last {
 +		s.stopMedia()
++		s.closeClient()
 +	}
-+	// Free the camera slot before notifying readers. They can trigger a
-+	// reconnect as soon as the read fails.
-+	_ = s.client.Close()
-+
-+	for _, st := range streams {
-+		st.close()
-+	}
-+
-+	if reason == shutdownNoStreams {
++	close(st.done)
++	if last {
 +		s.waitWorkerDone()
 +	}
-+
-+	s.finishShutdown()
 +}
 +
-+func (s *session) beginShutdown(reason shutdownReason) ([]*stream, bool) {
-+	s.mu.Lock()
-+	defer s.mu.Unlock()
-+
-+	if s.state != sessionActive {
-+		return nil, false
-+	}
-+	s.state = sessionClosing
-+	s.reason = reason
-+
-+	streams := make([]*stream, 0, len(s.streams))
++func (s *session) hasChannelLocked(channel uint8) bool {
 +	for st := range s.streams {
-+		streams = append(streams, st)
++		if st.channel == channel {
++			return true
++		}
 +	}
-+	s.streams = make(map[*stream]struct{})
-+	return streams, true
++	return false
 +}
 +
-+func (s *session) finishShutdown() {
++func (s *session) readFailed() {
 +	s.mu.Lock()
-+	s.state = sessionClosed
++	streams := s.streams
++	s.streams = nil
 +	s.mu.Unlock()
++	if streams == nil {
++		return
++	}
++	s.closeClient()
++	for st := range streams {
++		close(st.done)
++	}
 +}
 +
-+func (s *session) isActiveLocked() bool {
-+	return s.state == sessionActive
++func (s *session) closeClient() {
++	_ = s.client.Close()
++	if s.manager != nil {
++		s.manager.remove(s.key)
++	}
 +}
 +
 +func (s *session) stopMedia() {
@@ -2619,100 +2561,51 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +		close(done)
 +	}()
 +
-+	timer := time.NewTimer(stopMediaTimeout)
-+	defer timer.Stop()
-+
 +	select {
 +	case <-done:
-+	case <-timer.C:
++	case <-time.After(stopMediaTimeout):
 +	}
 +}
 +
 +func (s *session) waitWorkerDone() {
-+	timer := time.NewTimer(workerStopTimeout)
-+	defer timer.Stop()
-+
 +	select {
 +	case <-s.workerDone:
-+	case <-timer.C:
++	case <-time.After(workerStopTimeout):
 +	}
 +}
 +
 +// --- stream methods ---
 +
-+// ReadPacket reads the next packet for this stream, respecting deadlines.
-+func (st *stream) ReadPacket() (*Packet, error) {
-+	deadline, _ := st.deadline.Load().(time.Time)
-+	if deadline.IsZero() {
-+		select {
-+		case pkt := <-st.ch:
-+			return pkt, nil
-+		case <-st.done:
-+			return nil, io.EOF
-+		}
-+	}
-+
++// The probe and producer each own an absolute deadline. Buffered audio must
++// not keep a stopped video channel alive.
++func (st *stream) readPacket(deadline time.Time) (*Packet, error) {
 +	d := time.Until(deadline)
 +	if d <= 0 {
-+		// Check if there's already a packet available.
-+		select {
-+		case pkt := <-st.ch:
-+			return pkt, nil
-+		default:
-+			return nil, &net.OpError{Op: "read", Err: &timeoutError{}}
-+		}
++		return nil, os.ErrDeadlineExceeded
 +	}
-+
-+	timer := time.NewTimer(d)
-+	defer timer.Stop()
-+
 +	select {
 +	case pkt := <-st.ch:
 +		return pkt, nil
 +	case <-st.done:
 +		return nil, io.EOF
-+	case <-timer.C:
-+		return nil, &net.OpError{Op: "read", Err: &timeoutError{}}
++	case <-time.After(d):
++		return nil, os.ErrDeadlineExceeded
 +	}
-+}
-+
-+// SetDeadline sets a read deadline for this stream.
-+func (st *stream) SetDeadline(t time.Time) error {
-+	st.deadline.Store(t)
-+	return nil
-+}
-+
-+// RemoteAddr returns the remote address of the underlying connection.
-+func (st *stream) RemoteAddr() net.Addr {
-+	return st.session.client.RemoteAddr()
 +}
 +
 +// Close removes this stream from the session.
 +func (st *stream) Close() error {
-+	st.session.removeStream(st)
++	st.session.removeStream(st, false)
 +	return nil
 +}
 +
 +func (st *stream) push(pkt *Packet) {
-+	select {
-+	case <-st.done:
-+		return
-+	default:
-+	}
 +	select {
 +	case st.ch <- pkt:
 +	default:
 +		// Drop packet if the buffer is full.
 +	}
 +}
-+
-+func (st *stream) close() {
-+	st.closeOnce.Do(func() {
-+		close(st.done)
-+	})
-+}
-+
-+// --- helpers ---
 +
 +func isAudioCodec(codecID uint32) bool {
 +	switch codecID {
@@ -2721,145 +2614,137 @@ index 0000000000000000000000000000000000000000..7ebed27a31e78235a68d0089d5bea3bc
 +	}
 +	return false
 +}
-+
-+// timeoutError implements the net.Error interface for deadline timeouts.
-+type timeoutError struct{}
-+
-+func (e *timeoutError) Error() string   { return "i/o timeout" }
-+func (e *timeoutError) Timeout() bool   { return true }
-+func (e *timeoutError) Temporary() bool { return true }
 diff --git a/pkg/xiaomi/miss/session_manager.go b/pkg/xiaomi/miss/session_manager.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..ced8f90a812643cd56698fdd8b8d691e509794e4
+index 0000000000000000000000000000000000000000..7b0f501a5166f59f4d0cc99d4ef04d463ded8c9d
 --- /dev/null
 +++ b/pkg/xiaomi/miss/session_manager.go
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,119 @@
 +package miss
 +
-+import "sync"
++import (
++	"crypto/sha256"
++	"errors"
++	"net/url"
++	"strings"
++	"sync"
++)
 +
-+type clientFactory func(rawURL string) (sessionClient, error)
++type clientFactory func(string) (sessionClient, error)
 +
-+func defaultClientFactory(rawURL string) (sessionClient, error) {
-+	return NewClient(rawURL)
++type cameraDial struct {
++	ready   chan struct{}
++	session *session
++	err     error
 +}
 +
-+// sessionManager owns shared MISS sessions. It never dials while holding mu;
-+// when both manager and session locks are needed, acquire manager.mu first.
 +type sessionManager struct {
 +	mu        sync.Mutex
-+	sessions  map[string]*session
++	sessions  map[string]*cameraDial
 +	newClient clientFactory
 +}
 +
-+var defaultSessionManager = newSessionManager(defaultClientFactory)
++var defaultSessionManager = newSessionManager(func(raw string) (sessionClient, error) { return NewClient(raw) })
 +
-+func newSessionManager(newClient clientFactory) *sessionManager {
-+	return &sessionManager{
-+		sessions:  make(map[string]*session),
-+		newClient: newClient,
-+	}
++func newSessionManager(dial clientFactory) *sessionManager {
++	return &sessionManager{sessions: make(map[string]*cameraDial), newClient: dial}
 +}
 +
-+func (m *sessionManager) acquire(rawURL string, channel uint8, audio audioMode) (*session, *stream, error) {
-+	key, err := sessionKey(rawURL)
-+	if err != nil {
-+		return nil, nil, err
++// The cloud handler resolves a fresh signed key pair for the same account,
++// region and device. Direct sources instead authenticate with their supplied keys.
++func sessionScope(u *url.URL) [32]byte {
++	q := u.Query()
++	scope := url.Values{"account": {u.User.String()}}
++	for _, k := range []string{"did", "vendor", "model", "uid", "device_public"} {
++		scope.Set(k, q.Get(k))
 +	}
-+
-+	if s, st, ok := m.acquireExisting(key, channel, audio); ok {
-+		return s, st, nil
++	if u.User == nil || q.Get("did") == "" {
++		for _, k := range []string{"client_public", "client_private", "sign"} {
++			scope.Set(k, q.Get(k))
++		}
 +	}
++	return sha256.Sum256([]byte(scope.Encode()))
++}
 +
-+	client, err := m.newClient(rawURL)
-+	if err != nil {
-+		return nil, nil, err
-+	}
-+
-+	// Dafang-like models: no session sharing, return standalone session.
-+	if client.IsDafangLike() {
-+		s := newSession(client, key, nil)
-+		st, err := s.openStream(channel, audio)
++func (m *sessionManager) acquire(u *url.URL, channel uint8, audio audioMode) (*session, *stream, error) {
++	q := u.Query()
++	var s *session
++	if isDafangLike(q.Get("model")) {
++		client, err := m.newClient(u.String())
 +		if err != nil {
-+			_ = client.Close()
 +			return nil, nil, err
 +		}
-+		return s, st, nil
-+	}
-+
-+	s := newSession(client, key, m)
-+
-+	m.mu.Lock()
-+	if existing, ok := m.sessions[key]; ok {
-+		existing.mu.Lock()
-+		if existing.isActiveLocked() && !existing.client.IsDafangLike() {
-+			st, err := existing.openStreamLocked(channel, audio)
-+			existing.mu.Unlock()
-+			m.mu.Unlock()
-+			_ = client.Close()
-+			if err != nil {
-+				return nil, nil, err
-+			}
-+			existing.startWorker()
-+			return existing, st, nil
++		s = newSession(client, "", nil)
++	} else {
++		host := strings.ToLower(u.Host)
++		// The two transports also accept the camera address without their LAN port.
++		switch q.Get("vendor") {
++		case "cs2":
++			host = strings.TrimSuffix(host, ":32108")
++		case "tutk":
++			host = strings.TrimSuffix(host, ":32761")
 +		}
-+		existing.mu.Unlock()
-+	}
-+
-+	s.mu.Lock()
-+	st, err := s.openStreamLocked(channel, audio)
-+	s.mu.Unlock()
-+	if err != nil {
++		scope := sessionScope(u)
++		var protocol string
++		if transport := q.Get("transport"); q.Get("vendor") == "cs2" && transport != "" {
++			protocol = "cs2+" + transport
++		}
++		m.mu.Lock()
++		dial, exists := m.sessions[host]
++		if !exists {
++			dial = &cameraDial{ready: make(chan struct{})}
++			m.sessions[host] = dial
++		}
 +		m.mu.Unlock()
-+		_ = client.Close()
++		if exists {
++			<-dial.ready
++		} else {
++			client, err := m.newClient(u.String())
++			if err == nil && protocol != "" && client.Protocol() != protocol {
++				_ = client.Close()
++				err = errIncompatibleTransport
++			}
++			if err != nil {
++				dial.err = err
++				m.remove(host)
++			} else {
++				dial.session = newSession(client, host, m)
++				dial.session.scope = scope
++			}
++			close(dial.ready)
++		}
++		if dial.err != nil {
++			return nil, nil, dial.err
++		}
++		s = dial.session
++		if s.scope != scope {
++			return nil, nil, errors.New("miss: incompatible camera credentials or model")
++		}
++		if exists && protocol != "" && s.client.Protocol() != protocol {
++			return nil, nil, errIncompatibleTransport
++		}
++	}
++	st, err := s.openStream(channel, audio)
++	if err != nil {
 +		return nil, nil, err
 +	}
-+	m.sessions[key] = s
-+	m.mu.Unlock()
-+
-+	s.startWorker()
 +	return s, st, nil
 +}
 +
-+func (m *sessionManager) acquireExisting(key string, channel uint8, audio audioMode) (*session, *stream, bool) {
++var errIncompatibleTransport = errors.New("miss: incompatible camera transport")
++
++// Only the dial owner or the session that has just closed releases its slot.
++func (m *sessionManager) remove(host string) {
 +	m.mu.Lock()
-+	s, ok := m.sessions[key]
-+	if !ok {
-+		m.mu.Unlock()
-+		return nil, nil, false
-+	}
-+
-+	s.mu.Lock()
-+	if !s.isActiveLocked() || s.client.IsDafangLike() {
-+		s.mu.Unlock()
-+		m.mu.Unlock()
-+		return nil, nil, false
-+	}
-+
-+	st, err := s.openStreamLocked(channel, audio)
-+	s.mu.Unlock()
-+	m.mu.Unlock()
-+	if err != nil {
-+		return nil, nil, false
-+	}
-+
-+	s.startWorker()
-+	return s, st, true
-+}
-+
-+func (m *sessionManager) remove(s *session) {
-+	m.mu.Lock()
-+	if m.sessions[s.key] == s {
-+		delete(m.sessions, s.key)
-+	}
++	delete(m.sessions, host)
 +	m.mu.Unlock()
 +}
 diff --git a/pkg/xiaomi/miss/session_manager_test.go b/pkg/xiaomi/miss/session_manager_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fabd9dccbe
+index 0000000000000000000000000000000000000000..4eb470ed622b3a7d68efd57bd12805f414794171
 --- /dev/null
 +++ b/pkg/xiaomi/miss/session_manager_test.go
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,741 @@
 +package miss
 +
 +import (
@@ -2868,6 +2753,7 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +	"net"
 +	"net/url"
 +	"sync"
++	"sync/atomic"
 +	"testing"
 +	"time"
 +
@@ -2893,6 +2779,7 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +	startAudioErr       error
 +	stopMedia           int
 +	startSpeaker        int
++	startSpeakerErr     error
 +	writeAudio          int
 +	closeCount          int
 +	speakerCodec        uint32
@@ -2900,6 +2787,7 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +	closed    chan struct{}
 +	closeOnce sync.Once
 +	readErr   chan error
++	media     chan *Packet
 +	onClose   func()
 +}
 +
@@ -2910,7 +2798,7 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +	}
 +}
 +
-+func (c *fakeClient) Protocol() string { return "fake" }
++func (c *fakeClient) Protocol() string { return "cs2+udp" }
 +func (c *fakeClient) Version() string  { return "fake (model)" }
 +func (c *fakeClient) IsDafangLike() bool {
 +	return c.dafang
@@ -2951,8 +2839,9 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +func (c *fakeClient) StartSpeaker() error {
 +	c.mu.Lock()
 +	c.startSpeaker++
++	err := c.startSpeakerErr
 +	c.mu.Unlock()
-+	return nil
++	return err
 +}
 +
 +func (c *fakeClient) SpeakerCodec() uint32 {
@@ -2971,6 +2860,8 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +
 +func (c *fakeClient) ReadPacket() (*Packet, error) {
 +	select {
++	case pkt := <-c.media:
++		return pkt, nil
 +	case err := <-c.readErr:
 +		if err == nil {
 +			err = io.EOF
@@ -3017,9 +2908,9 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s1, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
-+	s2, st2, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	s2, st2, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 1, audioVideoStart)
 +	require.NoError(t, err)
 +	require.Same(t, s1, s2)
 +	require.Equal(t, uint8(0), st1.channel)
@@ -3039,9 +2930,9 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s1, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1&model=isa.camera.df3"), 0, audioVideoStart)
 +	require.NoError(t, err)
-+	s2, st2, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	s2, st2, err := manager.acquire(testURL(t, "xiaomi://host?did=1&model=isa.camera.df3"), 1, audioVideoStart)
 +	require.NoError(t, err)
 +	require.NotSame(t, s1, s2)
 +	require.Len(t, clients, 2)
@@ -3058,9 +2949,9 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s, st0, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
-+	peer, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	peer, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 1, audioVideoStart)
 +	require.NoError(t, err)
 +	require.Same(t, s, peer)
 +	streams := []*stream{st0, st1}
@@ -3095,7 +2986,7 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s, st, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
 +	require.NoError(t, st.Close())
 +	waitWorker(t, s)
@@ -3111,12 +3002,12 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s, st0, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(0, "hd", "1"))
-+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	require.NoError(t, s.startMedia(0, "hd"))
++	_, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 1, audioVideoStart)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(1, "sd", "1"))
++	require.NoError(t, s.startMedia(1, "sd"))
 +
 +	_, _, startMediaDual, startMediaChannels := client.counts()
 +	_, _, startAudio := client.audioCommands()
@@ -3136,18 +3027,18 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s, st0, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(0, "hd", "1"))
-+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	require.NoError(t, s.startMedia(0, "hd"))
++	_, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 1, audioVideoStart)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(1, "sd", "1"))
++	require.NoError(t, s.startMedia(1, "sd"))
 +
 +	require.NoError(t, st0.Close())
-+	s2, st0b, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s2, st0b, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
 +	require.Same(t, s, s2)
-+	require.NoError(t, s.startMedia(0, "hd", "1"))
++	require.NoError(t, s.startMedia(0, "hd"))
 +
 +	_, _, startMediaDual, startMediaChannels := client.counts()
 +	_, _, startAudio := client.audioCommands()
@@ -3166,22 +3057,29 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s, st0, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioDisabled)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(0, "hd", "1"))
-+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	require.NoError(t, s.startMedia(0, "hd"))
++	_, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 1, audioDisabled)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(1, "sd", "1"))
++	require.NoError(t, s.startMedia(1, "sd"))
 +
 +	require.NoError(t, st0.Close())
-+	s2, st0b, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s2, st0b, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioDisabled)
 +	require.NoError(t, err)
 +	require.Same(t, s, s2)
 +	require.NoError(t, st1.Close())
-+	require.NoError(t, s.startMedia(0, "hd", "1"))
++	require.NoError(t, s.startMedia(0, "hd"))
++	_, audio, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(0, "hd"))
++	singleAudio, dualAudio, _ := client.audioCommands()
++	require.Equal(t, []string{"0", "0", "1"}, singleAudio)
++	require.Equal(t, []string{"0"}, dualAudio)
++	require.NoError(t, audio.Close())
 +
 +	_, _, startMediaDual, startMediaChannels := client.counts()
-+	require.Equal(t, []string{"0", "0"}, startMediaChannels)
++	require.Equal(t, []string{"0", "0", "0"}, startMediaChannels)
 +	require.Equal(t, 1, startMediaDual)
 +
 +	require.NoError(t, st0b.Close())
@@ -3194,12 +3092,12 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s, st0, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(0, "hd", "1"))
-+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioDisabled)
++	require.NoError(t, s.startMedia(0, "hd"))
++	_, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 1, audioDisabled)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(1, "sd", "0"))
++	require.NoError(t, s.startMedia(1, "sd"))
 +
 +	startMediaAudio, startMediaDualAudio, startAudio := client.audioCommands()
 +	require.Equal(t, []string{"1"}, startMediaAudio)
@@ -3217,12 +3115,12 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioDisabled)
++	s, st0, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioDisabled)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(0, "hd", "0"))
-+	_, st1, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	require.NoError(t, s.startMedia(0, "hd"))
++	_, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(0, "hd", "1"))
++	require.NoError(t, s.startMedia(0, "hd"))
 +
 +	startMediaAudio, startMediaDualAudio, startAudio := client.audioCommands()
 +	require.Equal(t, []string{"0", "1"}, startMediaAudio)
@@ -3240,9 +3138,9 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st, err := manager.acquire("xiaomi://host?did=1", 0, audioCommandStart)
++	s, st, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioCommandStart)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(0, "hd", "2"))
++	require.NoError(t, s.startMedia(0, "hd"))
 +
 +	startMediaAudio, startMediaDualAudio, startAudio := client.audioCommands()
 +	require.Equal(t, []string{"1"}, startMediaAudio)
@@ -3260,13 +3158,24 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st, err := manager.acquire("xiaomi://host?did=1", 0, audioCommandStart)
++	s, st, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioCommandStart)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(0, "hd", "2"))
++	require.NoError(t, s.startMedia(0, "hd"))
 +
 +	_, _, startAudio := client.audioCommands()
 +	require.Equal(t, 1, startAudio)
 +
++	client.startAudioErr = nil
++	require.NoError(t, s.startMedia(0, "hd"))
++	require.NoError(t, s.startMedia(0, "hd"))
++	_, _, startAudio = client.audioCommands()
++	require.Equal(t, 2, startAudio)
++	client.startSpeakerErr = errors.New("speaker unavailable")
++	require.Error(t, s.startSpeaker())
++	client.startSpeakerErr = nil
++	require.NoError(t, s.startSpeaker())
++	require.NoError(t, s.startSpeaker())
++	require.Equal(t, 2, client.startSpeaker)
 +	require.NoError(t, st.Close())
 +	waitWorker(t, s)
 +}
@@ -3277,12 +3186,12 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioDisabled)
++	s, st0, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioDisabled)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(0, "hd", "0"))
-+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioDisabled)
++	require.NoError(t, s.startMedia(0, "hd"))
++	_, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 1, audioDisabled)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(1, "sd", "0"))
++	require.NoError(t, s.startMedia(1, "sd"))
 +
 +	startMediaAudio, startMediaDualAudio, startAudio := client.audioCommands()
 +	require.Equal(t, []string{"0"}, startMediaAudio)
@@ -3297,13 +3206,12 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +func TestSessionDispatchClassifiesAfterDualStreamCloses(t *testing.T) {
 +	s := newSession(newFakeClient(), "key", nil)
 +
-+	s.mu.Lock()
-+	st0, err := s.openStreamLocked(0, audioVideoStart)
++	st0, err := s.openStream(0, audioVideoStart)
 +	require.NoError(t, err)
-+	st1, err := s.openStreamLocked(1, audioVideoStart)
++	st1, err := s.openStream(1, audioVideoStart)
 +	require.NoError(t, err)
-+	s.startedMask = 0b11
-+	s.mu.Unlock()
++	require.NoError(t, s.startMedia(0, "hd"))
++	require.NoError(t, s.startMedia(1, "hd"))
 +
 +	prime0 := &Packet{CodecID: 0xFFFF, FlagsChannel: 0}
 +	prime1 := &Packet{CodecID: 0xFFFF, FlagsChannel: 1}
@@ -3331,19 +3239,18 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +	default:
 +	}
 +
-+	st1.close()
++	require.NoError(t, st1.Close())
 +}
 +
 +func TestSessionDispatchKeepsSingleStreamBeforeClassifierIsReady(t *testing.T) {
 +	s := newSession(newFakeClient(), "key", nil)
 +
-+	s.mu.Lock()
-+	st0, err := s.openStreamLocked(0, audioVideoStart)
++	st0, err := s.openStream(0, audioVideoStart)
 +	require.NoError(t, err)
-+	st1, err := s.openStreamLocked(1, audioVideoStart)
++	st1, err := s.openStream(1, audioVideoStart)
 +	require.NoError(t, err)
-+	s.startedMask = 0b11
-+	s.mu.Unlock()
++	require.NoError(t, s.startMedia(0, "hd"))
++	require.NoError(t, s.startMedia(1, "hd"))
 +
 +	require.NoError(t, st0.Close())
 +	pkt1 := &Packet{CodecID: 0xFFFF, FlagsChannel: 1}
@@ -3356,7 +3263,7 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		t.Fatal("expected remaining channel stream to receive packet before classifier is ready")
 +	}
 +
-+	st1.close()
++	require.NoError(t, st1.Close())
 +}
 +
 +func TestSessionStartMediaDualFailureDoesNotMarkSecondChannelStarted(t *testing.T) {
@@ -3366,15 +3273,22 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s, st0, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s, st0, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
-+	require.NoError(t, s.startMedia(0, "hd", "1"))
-+	_, st1, err := manager.acquire("xiaomi://host?did=1", 1, audioVideoStart)
++	require.NoError(t, s.startMedia(0, "hd"))
++	_, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 1, audioVideoStart)
 +	require.NoError(t, err)
-+	require.Error(t, s.startMedia(1, "sd", "1"))
++	require.Error(t, s.startMedia(1, "sd"))
 +	require.Equal(t, uint8(0b01), s.startedMask)
 +
 +	require.NoError(t, st1.Close())
++	client.startMediaDualErr = nil
++	s2, replacement, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 1, audioDisabled)
++	require.NoError(t, err)
++	require.Same(t, s, s2)
++	require.NoError(t, s.startMedia(1, "sd"))
++	require.Equal(t, uint8(0b11), s.startedMask)
++	require.NoError(t, replacement.Close())
 +	require.NoError(t, st0.Close())
 +	waitWorker(t, s)
 +}
@@ -3387,12 +3301,12 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s1, _, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s1, _, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
 +	clients[0].readErr <- errors.New("read failed")
 +	waitWorker(t, s1)
 +
-+	s2, st2, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s2, st2, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
 +	require.NotSame(t, s1, s2)
 +	require.Len(t, clients, 2)
@@ -3409,12 +3323,12 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +		return client, nil
 +	})
 +
-+	s1, st1, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s1, st1, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
 +	require.NoError(t, st1.Close())
 +	waitWorker(t, s1)
 +
-+	s2, st2, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
++	s2, st2, err := manager.acquire(testURL(t, "xiaomi://host?did=1"), 0, audioVideoStart)
 +	require.NoError(t, err)
 +	require.NotSame(t, s1, s2)
 +	require.Len(t, clients, 2)
@@ -3423,62 +3337,118 @@ index 0000000000000000000000000000000000000000..18c4ab0ab0a610b8d05a4d8cc217a9fa
 +	waitWorker(t, s2)
 +}
 +
-+func TestSessionManagerConcurrentAcquireClosesDuplicateClient(t *testing.T) {
-+	created := make(chan *fakeClient, 2)
-+	release := make(chan struct{})
-+	manager := newSessionManager(func(string) (sessionClient, error) {
-+		client := newFakeClient()
-+		created <- client
-+		<-release
-+		return client, nil
-+	})
++func testURL(t *testing.T, raw string) *url.URL {
++	t.Helper()
++	u, err := url.Parse(raw)
++	require.NoError(t, err)
++	return u
++}
 +
-+	type result struct {
-+		session *session
-+		stream  *stream
-+		err     error
-+	}
-+	results := make(chan result, 2)
-+	for range 2 {
++func TestSessionManagerConcurrentAcquireDialsOnce(t *testing.T) {
++	entered := make(chan struct{}, 2)
++	var count atomic.Int32
++	release := make(chan struct{})
++	m := newSessionManager(func(raw string) (sessionClient, error) {
++		if raw == "xiaomi://slow" {
++			count.Add(1)
++			entered <- struct{}{}
++			<-release
++		}
++		return newFakeClient(), nil
++	})
++	results := make(chan *stream, 2)
++	for ch := range uint8(2) {
 +		go func() {
-+			s, st, err := manager.acquire("xiaomi://host?did=1", 0, audioVideoStart)
-+			results <- result{session: s, stream: st, err: err}
++			_, st, err := m.acquire(testURL(t, "xiaomi://slow"), ch, audioDisabled)
++			if err != nil {
++				t.Error(err)
++			}
++			results <- st
 +		}()
 +	}
-+
-+	var clients []*fakeClient
-+	for range 2 {
-+		select {
-+		case client := <-created:
-+			clients = append(clients, client)
-+		case <-time.After(time.Second):
-+			t.Fatal("timed out waiting for duplicate dials")
-+		}
-+	}
++	<-entered
++	require.EqualValues(t, 1, count.Load())
++	_, other, err := m.acquire(testURL(t, "xiaomi://other"), 0, audioDisabled)
++	require.NoError(t, err)
++	require.NoError(t, other.Close())
 +	close(release)
++	a, b := <-results, <-results
++	require.EqualValues(t, 1, count.Load())
++	require.Same(t, a.session, b.session)
++	require.NoError(t, a.Close())
++	require.NoError(t, b.Close())
++}
 +
-+	var got []result
-+	for range 2 {
-+		select {
-+		case res := <-results:
-+			require.NoError(t, res.err)
-+			got = append(got, res)
-+		case <-time.After(time.Second):
-+			t.Fatal("timed out waiting for acquire results")
++func TestSessionManagerReservesClosingDevice(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	first := newFakeClient()
++	first.onClose = func() { close(entered); <-release }
++	dials := 0
++	m := newSessionManager(func(string) (sessionClient, error) {
++		dials++
++		if dials == 1 {
++			return first, nil
 +		}
-+	}
++		return newFakeClient(), nil
++	})
++	u := testURL(t, "xiaomi://camera")
++	s, st, err := m.acquire(u, 0, audioDisabled)
++	require.NoError(t, err)
++	done := make(chan struct{})
++	go func() { _ = st.Close(); close(done) }()
++	<-entered
++	_, _, err = m.acquire(u, 1, audioDisabled)
++	require.ErrorIs(t, err, errSessionClosing)
++	require.Equal(t, 1, dials)
++	close(release)
++	<-done
++	waitWorker(t, s)
++	_, st, err = m.acquire(u, 1, audioDisabled)
++	require.NoError(t, err)
++	require.NoError(t, st.Close())
++}
 +
-+	require.Same(t, got[0].session, got[1].session)
-+	closeCounts := 0
-+	for _, client := range clients {
-+		_, closeCount, _, _ := client.counts()
-+		closeCounts += closeCount
++func TestSessionCompatibility(t *testing.T) {
++	count := 0
++	m := newSessionManager(func(string) (sessionClient, error) { count++; return newFakeClient(), nil })
++	const source = "xiaomi://user:cn@host?did=1&vendor=cs2"
++	s, st, err := m.acquire(testURL(t, source), 1, audioDisabled)
++	require.NoError(t, err)
++	for _, raw := range []string{"xiaomi://other:cn@host?did=1&vendor=cs2", "xiaomi://user:tw@host?did=1&vendor=cs2", source + "&transport=tcp", source + "&device_public=different", "xiaomi://host?did=1&vendor=cs2"} {
++		_, _, err = m.acquire(testURL(t, raw), 0, audioDisabled)
++		require.Error(t, err)
 +	}
-+	require.Equal(t, 1, closeCounts)
++	_, peer, err := m.acquire(testURL(t, source+"&transport=udp&sign=renewed"), 1, audioDisabled)
++	require.NoError(t, err)
++	require.NoError(t, s.startMedia(1, "2"))
++	require.Error(t, s.startMedia(1, "1"))
++	require.Equal(t, 1, count)
++	require.NoError(t, peer.Close())
++	require.NoError(t, st.Close())
++	_, st, err = m.acquire(testURL(t, "xiaomi://host?client_private=one"), 0, audioDisabled)
++	require.NoError(t, err)
++	_, _, err = m.acquire(testURL(t, "xiaomi://host?client_private=two"), 0, audioDisabled)
++	require.Error(t, err)
++	require.NoError(t, st.Close())
++}
 +
-+	require.NoError(t, got[0].stream.Close())
-+	require.NoError(t, got[1].stream.Close())
-+	waitWorker(t, got[0].session)
++func TestSessionManagerDefaultPorts(t *testing.T) {
++	for vendor, port := range map[string]string{"cs2": "32108", "tutk": "32761"} {
++		t.Run(vendor, func(t *testing.T) {
++			m := newSessionManager(func(string) (sessionClient, error) { return newFakeClient(), nil })
++			open := func(port string) *stream {
++				t.Helper()
++				u := testURL(t, "xiaomi://192.0.2.10"+port+"?vendor="+vendor)
++				_, st, err := m.acquire(u, 0, audioDisabled)
++				require.NoError(t, err)
++				t.Cleanup(func() { _ = st.Close() })
++				return st
++			}
++			first := open("")
++			require.Same(t, first.session, open(":"+port).session)
++			require.NotSame(t, first.session, open(":10001").session)
++		})
++	}
 +}
 +
 +func TestParseChannel(t *testing.T) {
